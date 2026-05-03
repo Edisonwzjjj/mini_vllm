@@ -55,3 +55,6 @@ class Sequence:
 
     def is_finished(self) -> bool:
         return self.status == SequenceStatus.FINISHED
+    
+    def mark_finished(self):
+        self.status = SequenceStatus.FINISHED

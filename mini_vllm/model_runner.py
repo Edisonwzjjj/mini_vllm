@@ -74,7 +74,10 @@ class ModelRunner:
         paged_ctx.slot_mapping = slot_mapping        # List[int]
         paged_ctx.num_cached_tokens = seqs.num_prompt_tokens
         paged_ctx.is_prefill = True
-        
+
+        print(f"[PREFILL] prompt_len={seqs.num_prompt_tokens}, "
+              f"block_table={block_tables}, slot_mapping={slot_mapping}")
+
         with torch.no_grad():
             outputs = self.model(input_ids=input_ids, position_ids=position_ids)
         seqs.num_cached_tokens += len(seqs.prompt_token_ids)
@@ -106,7 +109,10 @@ class ModelRunner:
         paged_ctx.slot_mapping = slot_mapping            # List[int], 长度=1
         paged_ctx.num_cached_tokens = total_tokens_after # 旧缓存 + 新写入的 1 个
         paged_ctx.is_prefill = False
-        
+
+        print(f"[DECODE] pos={seqs.num_cached_tokens}, "
+              f"block_table={seqs.block_table[0]}, slot_mapping={slot_mapping}")
+
         with torch.no_grad():
             outputs = self.model(input_ids=input_ids, position_ids=position_ids)
         seqs.num_cached_tokens += 1
