@@ -1,5 +1,6 @@
 """Model runner — loads HF model, allocates KV cache, runs forward passes."""
 
+import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from mini_vllm.attention_patch import apply_attention_patch, paged_ctx
@@ -12,7 +13,7 @@ class ModelRunner:
         self.device = "mps" if torch.backends.mps.is_available() else "cpu"
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path, dtype=torch.float32
-        ).to(self.device)
+        ).to(self.device).eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.block_size = block_size
         self.max_num_seqs = max_num_seqs
@@ -57,64 +58,124 @@ class ModelRunner:
         print(f"KV cache: {num_blocks} blocks/layer × {self.num_layers} layers, {total_gb:.2f} GB")
         return kv_cache
 
-    def run_prefill(self, seqs: Sequence):
-        num_blocks_needed = self.block_manager.num_blocks_needed(seqs.num_prompt_tokens)
-        cur_blocks = len(seqs.block_table[0])
-        if cur_blocks < num_blocks_needed:
-            new_blocks = self.block_manager.allocate(num_blocks_needed - cur_blocks)
-            for layer in range(self.num_layers):
-                seqs.block_table[layer].extend(new_blocks)
-        block_tables = seqs.block_table[0]
-        slot_mapping = self.block_manager.get_slot_mapping(block_tables, seqs.num_prompt_tokens)
-        input_ids = torch.tensor([seqs.prompt_token_ids], device=self.device)
-        position_ids = torch.arange(len(seqs.prompt_token_ids), device=self.device).unsqueeze(0)
-        
+    def run_prefill(self, seqs: list[Sequence]):
+        # 1. Allocate blocks & build per-sequence input_ids / position_ids / slot_mapping
+        all_input_ids = []
+        all_position_ids = []
+        all_slots = []
+        seq_lengths = []
+
+        for seq in seqs:
+            cur_blocks = len(seq.block_table[0])
+            num_blocks_needed = self.block_manager.num_blocks_needed(seq.num_prompt_tokens)
+            if cur_blocks < num_blocks_needed:
+                new_blocks = self.block_manager.allocate(num_blocks_needed - cur_blocks)
+                for layer in range(self.num_layers):
+                    seq.block_table[layer].extend(new_blocks)
+            block_tables = seq.block_table[0]
+            slot_mapping = self.block_manager.get_slot_mapping(block_tables, seq.num_prompt_tokens)
+
+            all_input_ids.extend(seq.prompt_token_ids)
+            all_position_ids.extend(range(seq.num_prompt_tokens))
+            all_slots.extend(slot_mapping)
+            seq_lengths.append(seq.num_prompt_tokens)
+
+        total_len = sum(seq_lengths)
+
+        input_ids = torch.tensor([all_input_ids], device=self.device)
+        position_ids = torch.tensor([all_position_ids], device=self.device)
+
+        # 2. Build block-diagonal causal mask
+        mask = torch.zeros(total_len, total_len, device=self.device)
+        start = 0
+        for length in seq_lengths:
+            end = start + length
+            mask[start:end, start:end] = torch.tril(torch.ones(length, length, device=self.device))
+            start = end
+        mask = mask.masked_fill(mask == 0, float('-inf'))
+
+        # 3. Set paged context
         paged_ctx.kv_cache = self.kv_cache
-        paged_ctx.block_table = block_tables        # List[int]
-        paged_ctx.slot_mapping = slot_mapping        # List[int]
-        paged_ctx.num_cached_tokens = seqs.num_prompt_tokens
+        paged_ctx.slot_mapping = all_slots      # flat list
+        paged_ctx.num_cached_tokens = total_len
         paged_ctx.is_prefill = True
+        paged_ctx.attn_mask = mask               # (total_len, total_len)
 
-        print(f"[PREFILL] prompt_len={seqs.num_prompt_tokens}, "
-              f"block_table={block_tables}, slot_mapping={slot_mapping}")
+        print(f"[PREFILL] {len(seqs)} seqs, total_tokens={total_len}, "
+              f"seq_lengths={seq_lengths}")
+        if os.environ.get("MINI_VLLM_DEBUG"):
+            print(f"  slot_mapping={all_slots}")
 
+        # 4. Forward
         with torch.no_grad():
             outputs = self.model(input_ids=input_ids, position_ids=position_ids)
-        seqs.num_cached_tokens += len(seqs.prompt_token_ids)
-        return outputs.logits[:, -1, :]
+
+        # 5. Update num_cached_tokens AFTER forward
+        for seq in seqs:
+            seq.num_cached_tokens += seq.num_prompt_tokens
+
+        # 6. Extract last-position logits for each sequence
+        logits = outputs.logits  # (1, total_len, vocab_size)
+        result_logits = []
+        start = 0
+        for length in seq_lengths:
+            last_pos = start + length - 1
+            result_logits.append(logits[0, last_pos, :])  # (vocab_size,)
+            start += length
+        return result_logits
         
 
-    def run_decode(self, seqs: Sequence):
-        total_tokens_after = seqs.num_cached_tokens + 1
-        num_blocks_needed = self.block_manager.num_blocks_needed(total_tokens_after)
-        cur_blocks = len(seqs.block_table[0])
-        if cur_blocks < num_blocks_needed:
-            new_blocks = self.block_manager.allocate(num_blocks_needed - cur_blocks)
-            for layer in range(self.num_layers):
-                seqs.block_table[layer].extend(new_blocks)
-        
-        new_token_pos = seqs.num_cached_tokens
-        block_idx = new_token_pos // self.block_size
-        offsets = new_token_pos % self.block_size
-        block_id = seqs.block_table[0][block_idx] 
-        slot = block_id * self.block_size + offsets
-        
-        slot_mapping = [slot]
-        
-        input_ids = torch.tensor([[seqs.last_token_id]], device=self.device)
-        position_ids = torch.tensor([[seqs.num_tokens - 1]], device=self.device)
-        
+    def run_decode(self, seqs: list[Sequence]):
+        # 1. Allocate blocks & compute per-sequence slot
+        decode_infos = []
+        for seq in seqs:
+            total_tokens_after = seq.num_cached_tokens + 1
+            num_blocks_needed = self.block_manager.num_blocks_needed(total_tokens_after)
+            cur_blocks = len(seq.block_table[0])
+            if cur_blocks < num_blocks_needed:
+                new_blocks = self.block_manager.allocate(num_blocks_needed - cur_blocks)
+                for layer in range(self.num_layers):
+                    seq.block_table[layer].extend(new_blocks)
+
+            new_token_pos = seq.num_cached_tokens
+            block_idx = new_token_pos // self.block_size
+            offset = new_token_pos % self.block_size
+            block_id = seq.block_table[0][block_idx]
+            slot = block_id * self.block_size + offset
+
+            decode_infos.append({
+                "slot": slot,
+                "block_table": seq.block_table[0],
+                "num_cached_after": total_tokens_after,
+            })
+
+        # 2. Build batch input
+        input_ids = torch.tensor(
+            [[seq.last_token_id] for seq in seqs], device=self.device
+        )  # (batch_size, 1)
+        position_ids = torch.tensor(
+            [[seq.num_tokens - 1] for seq in seqs], device=self.device
+        )  # (batch_size, 1)
+
+        # 3. Set paged context
         paged_ctx.kv_cache = self.kv_cache
-        paged_ctx.block_table = seqs.block_table[0]      # List[int]
-        paged_ctx.slot_mapping = slot_mapping            # List[int], 长度=1
-        paged_ctx.num_cached_tokens = total_tokens_after # 旧缓存 + 新写入的 1 个
+        paged_ctx.slot_mapping = [info["slot"] for info in decode_infos]
+        paged_ctx.block_tables = [info["block_table"] for info in decode_infos]
+        paged_ctx.num_cached_after = [info["num_cached_after"] for info in decode_infos]
         paged_ctx.is_prefill = False
 
-        print(f"[DECODE] pos={seqs.num_cached_tokens}, "
-              f"block_table={seqs.block_table[0]}, slot_mapping={slot_mapping}")
+        if os.environ.get("MINI_VLLM_DEBUG"):
+            print(f"[DECODE] {len(seqs)} seqs")
 
+        # 4. Forward
         with torch.no_grad():
             outputs = self.model(input_ids=input_ids, position_ids=position_ids)
-        seqs.num_cached_tokens += 1
-        return outputs.logits[:, -1, :]
+
+        # 5. Update num_cached_tokens & extract logits
+        logits_list = []
+        for i, seq in enumerate(seqs):
+            seq.num_cached_tokens += 1
+            logits_list.append(outputs.logits[i, -1, :])  # (vocab_size,)
+
+        return logits_list
         

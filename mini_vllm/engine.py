@@ -45,21 +45,31 @@ class LLMEngine:
         if not scheduler_output.seqs:
             return []  # all finished
 
+        seqs = scheduler_output.seqs
         finished = []
-        for seq in scheduler_output.seqs:
-            if scheduler_output.is_prefill:
-                logits = self.model_runner.run_prefill(seq)
-            else:
-                logits = self.model_runner.run_decode(seq)
 
-            next_token = sample_token(logits, sampling_params)
-            seq.output_token_ids.append(next_token)
-
-            if (next_token == self.model_runner.eos_token_id
-                    or seq.num_output_tokens >= sampling_params.max_tokens):
-                seq.mark_finished()
-                finished.append(seq)
-                self.scheduler.postprocess(seq)
+        if scheduler_output.is_prefill:
+            # Batched prefill: returns one logits per sequence
+            logits_list = self.model_runner.run_prefill(seqs)
+            for seq, logits in zip(seqs, logits_list):
+                next_token = sample_token(logits, sampling_params)
+                seq.output_token_ids.append(next_token)
+                if (next_token == self.model_runner.eos_token_id
+                        or seq.num_output_tokens >= sampling_params.max_tokens):
+                    seq.mark_finished()
+                    finished.append(seq)
+                    self.scheduler.postprocess(seq)
+        else:
+            # Batched decode: returns one logits per sequence
+            logits_list = self.model_runner.run_decode(seqs)
+            for seq, logits in zip(seqs, logits_list):
+                next_token = sample_token(logits, sampling_params)
+                seq.output_token_ids.append(next_token)
+                if (next_token == self.model_runner.eos_token_id
+                        or seq.num_output_tokens >= sampling_params.max_tokens):
+                    seq.mark_finished()
+                    finished.append(seq)
+                    self.scheduler.postprocess(seq)
 
         return finished
 

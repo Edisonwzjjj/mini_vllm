@@ -33,10 +33,20 @@ class Scheduler:
     def schedule(self) -> SchedulerOutput:
         """Schedule the next batch of sequences."""
         if self.waiting_seqs:
-            # Prefill: take one sequence from waiting, move to running
-            seq = self.waiting_seqs.pop(0)
-            self.running_seqs.append(seq)
-            return SchedulerOutput(seqs=[seq], is_prefill=True)
+            # Prefill: take all waiting sequences up to limits, move to running
+            prefill_seqs = []
+            total_tokens = 0
+            while self.waiting_seqs:
+                seq = self.waiting_seqs[0]
+                if len(self.running_seqs) + len(prefill_seqs) >= self.max_num_seqs:
+                    break
+                if total_tokens + seq.num_prompt_tokens > self.max_num_batched_tokens:
+                    break
+                self.waiting_seqs.pop(0)
+                self.running_seqs.append(seq)
+                prefill_seqs.append(seq)
+                total_tokens += seq.num_prompt_tokens
+            return SchedulerOutput(seqs=prefill_seqs, is_prefill=True)
         if self.running_seqs:
             # Decode: run ALL running sequences together
             return SchedulerOutput(seqs=list(self.running_seqs), is_prefill=False)

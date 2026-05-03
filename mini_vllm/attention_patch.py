@@ -10,11 +10,14 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 class PageContext:
     """Runtime context set by ModelRunner before each forward call."""
-    kv_cache: torch.Tensor = None       # (num_layers, num_blocks, 2, num_kv_heads, block_size, head_dim)
-    block_table: list = None            # List[int] — M1: same for all layers
-    slot_mapping: list = None           # List[int] — M1: same for all layers
-    num_cached_tokens: int = 0
+    kv_cache: torch.Tensor      # (num_layers, num_blocks, 2, num_kv_heads, block_size, head_dim)
+    block_table: list = None    # List[int] — used for single-seq decode only
+    block_tables: list = None   # List[List[int]] — per-seq block tables for batched decode
+    slot_mapping: list           # List[int] — flat list of slot indices
+    num_cached_tokens: int = 0  # used for prefill
+    num_cached_after: list = None  # List[int] — per-seq cached counts for batched decode
     is_prefill: bool = True
+    attn_mask: torch.Tensor = None   # (total_len, total_len) block-diagonal causal mask for prefill
 
 
 paged_ctx = PageContext()
@@ -59,7 +62,6 @@ def paged_attention_forward(
 
     # ========== 3. Paged KV Cache read/write ==========
     kv_cache = paged_ctx.kv_cache
-    block_table = paged_ctx.block_table          # List[int]
     slot_mapping = paged_ctx.slot_mapping        # List[int]
     num_cached = paged_ctx.num_cached_tokens
     is_prefill = paged_ctx.is_prefill
@@ -81,34 +83,62 @@ def paged_attention_forward(
         K_attn = key_states
         V_attn = value_states
     else:
-        # --- Write 1 new token K, V into cache ---
+        # --- Batched decode: write K/V, then padded batch SDPA ---
         slots = torch.tensor(slot_mapping, device=kv_cache.device)
-        bid = slots[0].item() // block_size
-        off = slots[0].item() % block_size
-        kv_cache[layer_idx, bid, 0, :, off, :] = key_states[0, :, 0, :]
-        kv_cache[layer_idx, bid, 1, :, off, :] = value_states[0, :, 0, :]
+        block_tables = paged_ctx.block_tables       # List[List[int]]
+        num_cached_list = paged_ctx.num_cached_after # List[int]
+        max_cached = max(num_cached_list)
 
-        # --- Read full K, V from cache via block_table ---
-        K_parts = []
-        V_parts = []
-        for bid in block_table:
-            K_parts.append(kv_cache[layer_idx, bid, 0])   # [num_kv_heads, block_size, head_dim]
-            V_parts.append(kv_cache[layer_idx, bid, 1])
+        # Write each sequence's new K/V to its cache slot
+        for i in range(bsz):
+            bid = slots[i].item() // block_size
+            off = slots[i].item() % block_size
+            kv_cache[layer_idx, bid, 0, :, off, :] = key_states[i, :, 0, :]
+            kv_cache[layer_idx, bid, 1, :, off, :] = value_states[i, :, 0, :]
 
-        K_full = torch.cat(K_parts, dim=1)[:, :num_cached, :]  # [num_kv_heads, num_cached, head_dim]
-        V_full = torch.cat(V_parts, dim=1)[:, :num_cached, :]
+        # Read K/V from cache into padded batch tensor
+        K_batch = kv_cache.new_zeros(bsz, num_kv_heads, max_cached, self.head_dim)
+        V_batch = kv_cache.new_zeros(bsz, num_kv_heads, max_cached, self.head_dim)
+        for i in range(bsz):
+            bt = block_tables[i]
+            K_blocks = kv_cache[layer_idx, bt, 0]   # (n_blocks, num_kv_heads, block_size, head_dim)
+            V_blocks = kv_cache[layer_idx, bt, 1]
+            K_full = K_blocks.permute(1, 0, 2, 3).reshape(num_kv_heads, -1, self.head_dim)[:, :num_cached_list[i], :]
+            V_full = V_blocks.permute(1, 0, 2, 3).reshape(num_kv_heads, -1, self.head_dim)[:, :num_cached_list[i], :]
+            K_batch[i, :, :num_cached_list[i], :] = K_full
+            V_batch[i, :, :num_cached_list[i], :] = V_full
 
-        K_attn = K_full.unsqueeze(0)   # [1, num_kv_heads, num_cached, head_dim]
-        V_attn = V_full.unsqueeze(0)
+        K_attn = K_batch
+        V_attn = V_batch
 
     # ========== 4. GQA expand + Attention ==========
-    K_expanded = repeat_kv(K_attn, self.num_key_value_groups)  # 2 groups → [1, 16, kv_len, 128]
+    K_expanded = repeat_kv(K_attn, self.num_key_value_groups)
     V_expanded = repeat_kv(V_attn, self.num_key_value_groups)
 
-    attn_output = F.scaled_dot_product_attention(
-        query_states, K_expanded, V_expanded,
-        is_causal=is_prefill,   # prefill: need causal mask; decode: 1 token, no mask needed
-    )  # [1, 16, seq_len, 128]
+    if is_prefill:
+        if paged_ctx.attn_mask is not None:
+            mask = paged_ctx.attn_mask.unsqueeze(0).unsqueeze(0).expand(
+                -1, num_heads, -1, -1
+            )
+            attn_output = F.scaled_dot_product_attention(
+                query_states, K_expanded, V_expanded,
+                attn_mask=mask,
+            )
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                query_states, K_expanded, V_expanded,
+                is_causal=True,
+            )
+    else:
+        # Decode: mask out padding positions in padded KV
+        # Build mask: (bsz, 1, 1, max_cached), 0 = attend, -inf = padding
+        decode_mask = torch.zeros(bsz, 1, 1, max_cached, device=kv_cache.device)
+        for i in range(bsz):
+            decode_mask[i, 0, 0, num_cached_list[i]:] = float('-inf')
+        attn_output = F.scaled_dot_product_attention(
+            query_states, K_expanded, V_expanded,
+            attn_mask=decode_mask,
+        )
 
     # ========== 5. Output projection (same as original) ==========
     attn_output = attn_output.transpose(1, 2).contiguous().reshape(

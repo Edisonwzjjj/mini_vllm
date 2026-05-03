@@ -1,4 +1,4 @@
-"""Basic usage example — M1 single sequence."""
+"""Basic usage example — M2 multi-sequence."""
 
 from mini_vllm import LLM, SamplingParams
 
@@ -11,6 +11,9 @@ llm = LLM(
 )
 
 sp = SamplingParams(temperature=0.01, max_tokens=20)
-outputs = llm.generate(prompts=["Hello, world."], sampling_params=sp)
+outputs = llm.generate(
+    prompts=["Hello, world.", "What is attention?", "The capital of France is"],
+    sampling_params=sp,
+)
 for o in outputs:
     print(o["text"])

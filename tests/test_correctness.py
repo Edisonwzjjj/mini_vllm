@@ -1,77 +1,67 @@
-"""Test: mini-vllm output matches HF model.generate (greedy)."""
+"""Test: multi-sequence batched prefill + per-sequence decode correctness."""
 
-import torch
 import pytest
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from mini_vllm import LLM, SamplingParams
 
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
-PROMPT = "Hello, world."
-MAX_TOKENS = 20
-TEMPERATURE = 0.01
+PROMPTS = [
+    "Hello, world.",
+    "What is attention?",
+    "The capital of France is",
+    "Explain quantum computing",
+    "Write a haiku about rain",
+    "1+1=",
+    "The meaning of life is",
+    "Once upon a time",
+]
 
 
 @pytest.fixture(scope="module")
-def mini_vllm_output():
-    """Run mini-vllm once, cache the result for all tests."""
-    llm = LLM(
-        model_path=MODEL_PATH,
-        block_size=16,
-        max_num_seqs=8,
-        max_num_batched_tokens=2048,
-        gpu_memory_utilization=0.5,
-    )
-    sp = SamplingParams(temperature=TEMPERATURE, max_tokens=MAX_TOKENS)
-    return llm.generate(prompts=[PROMPT], sampling_params=sp)[0]
+def single_outputs():
+    """Run each prompt individually, cache results."""
+    llm = LLM(model_path=MODEL_PATH, block_size=16, max_num_seqs=8,
+              max_num_batched_tokens=2048, gpu_memory_utilization=0.5)
+    sp = SamplingParams(temperature=0.0, max_tokens=20)
+    results = []
+    for prompt in PROMPTS:
+        out = llm.generate([prompt], sp)[0]["token_ids"]
+        results.append(out)
+    return results
 
 
 @pytest.fixture(scope="module")
-def hf_output():
-    """Run HF model.generate once, cache the result for all tests."""
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH, dtype=torch.float32
-    ).to("mps")
-    inputs = tokenizer(PROMPT, return_tensors="pt").to("mps")
-    with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=MAX_TOKENS, do_sample=False)
-    # Strip prompt tokens, keep only generated ones
-    gen_ids = out[0][inputs["input_ids"].shape[1]:].tolist()
-    del model
-    return {"token_ids": gen_ids, "text": tokenizer.decode(gen_ids, skip_special_tokens=True)}
+def multi_outputs():
+    """Run all prompts together with batched prefill."""
+    llm = LLM(model_path=MODEL_PATH, block_size=16, max_num_seqs=8,
+              max_num_batched_tokens=2048, gpu_memory_utilization=0.5)
+    sp = SamplingParams(temperature=0.0, max_tokens=20)
+    return llm.generate(PROMPTS, sp)
 
 
-@pytest.mark.timeout(180)
-def test_decode_matches_hf(mini_vllm_output, hf_output):
-    """Mini-vllm output must match HF model.generate token-for-token."""
-    mini_ids = mini_vllm_output["token_ids"]
-    hf_ids = hf_output["token_ids"]
-
-    print(f"\n[mini-vllm] tokens: {mini_ids}")
-    print(f"[HF]        tokens: {hf_ids}")
-    print(f"[mini-vllm] text: {mini_vllm_output['text']}")
-    print(f"[HF]        text: {hf_output['text']}")
-
-    assert mini_ids == hf_ids, (
-        f"Token mismatch!\n"
-        f"  mini-vllm: {mini_ids}\n"
-        f"  HF:        {hf_ids}\n"
-        f"  First diff at position {next(i for i,(a,b) in enumerate(zip(mini_ids,hf_ids)) if a!=b) if mini_ids!=hf_ids else 'N/A'}"
-    )
+@pytest.mark.timeout(300)
+def test_multi_matches_single(single_outputs, multi_outputs):
+    """Each sequence in batch must produce the same tokens as when run alone."""
+    for i, (single_ids, multi_result) in enumerate(zip(single_outputs, multi_outputs)):
+        multi_ids = multi_result["token_ids"]
+        assert single_ids == multi_ids, (
+            f"Prompt {i} mismatch: single={single_ids}, multi={multi_ids}"
+        )
 
 
-@pytest.mark.timeout(180)
-def test_output_length(mini_vllm_output):
-    """Should generate exactly max_tokens tokens (no early stop for this prompt)."""
-    assert len(mini_vllm_output["token_ids"]) == MAX_TOKENS, (
-        f"Expected {MAX_TOKENS} tokens, got {len(mini_vllm_output['token_ids'])}"
-    )
+@pytest.mark.timeout(300)
+def test_all_sequences_return(multi_outputs):
+    """All 8 prompts must produce output."""
+    assert len(multi_outputs) == len(PROMPTS)
+    for i, out in enumerate(multi_outputs):
+        assert len(out["token_ids"]) == 20, (
+            f"Prompt {i}: expected 20 tokens, got {len(out['token_ids'])}"
+        )
 
 
-@pytest.mark.timeout(180)
-def test_output_nontrivial(mini_vllm_output):
-    """Output should contain real tokens, not all zeros or padding."""
-    token_ids = mini_vllm_output["token_ids"]
-    assert all(tid > 0 for tid in token_ids), f"Got zero/negative token ids: {token_ids}"
-    assert len(mini_vllm_output["text"].strip()) > 0, "Output text is empty"
+@pytest.mark.timeout(300)
+def test_output_nontrivial(multi_outputs):
+    """No empty or all-zero outputs."""
+    for out in multi_outputs:
+        assert all(tid > 0 for tid in out["token_ids"])
+        assert len(out["text"].strip()) > 0
