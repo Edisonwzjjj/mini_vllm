@@ -39,6 +39,11 @@ class LLMEngine:
         )
         self.scheduler = Scheduler(config.max_num_seqs, config.max_num_batched_tokens)
 
+    def _free_seq_resources(self, seq: Sequence) -> None:
+        """Deallocate a finished sequence's blocks."""
+        for layer in range(self.model_runner.num_layers):
+            self.model_runner.block_manager.deallocate(seq.block_table[layer])
+
     def step(self, sampling_params: SamplingParams):
         """One iteration: schedule → forward → sample → append → check done."""
         scheduler_output = self.scheduler.schedule()
@@ -59,6 +64,7 @@ class LLMEngine:
                     seq.mark_finished()
                     finished.append(seq)
                     self.scheduler.postprocess(seq)
+                    self._free_seq_resources(seq)
         else:
             # Batched decode: returns one logits per sequence
             logits_list = self.model_runner.run_decode(seqs)
@@ -70,6 +76,7 @@ class LLMEngine:
                     seq.mark_finished()
                     finished.append(seq)
                     self.scheduler.postprocess(seq)
+                    self._free_seq_resources(seq)
 
         return finished
 

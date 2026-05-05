@@ -49,30 +49,60 @@ def test_prefix_cache_output_correctness(llm):
 
 
 @pytest.mark.timeout(300)
-def test_prefix_cache_hit_count(llm):
-    """Prefix cache should hit shared prefix blocks on the 2nd batch.
+def test_2nd_3rd_prefill_fewer_tokens(llm):
+    """M3 acceptance: send 3 same-prefix prompts, 2nd and 3rd compute fewer tokens.
 
-    Send same-prefix prompts in two batches:
-      - Batch 1: no hits (cache empty)
-      - Batch 2: should hit prefix blocks
-    Verify that hash_to_block_id grows after batch 1.
+    Key: all 3 must be in the SAME generate() call so prefix cache
+    is shared across sequences (blocks are not freed until all finish).
     """
     sp = SamplingParams(temperature=0.0, max_tokens=5)
-    prompts = [SYSTEM_PROMPT + q for q in QUERIES[:2]]
+    prefix = "You are a helpful AI assistant. " * 12  # ~108 tokens
 
-    # Batch 1: populate cache
-    llm.generate(prompts, sp)
+    prompts = [
+        prefix + "What is the capital of France?",
+        prefix + "What is the capital of Germany?",
+        prefix + "What is the capital of Japan?",
+    ]
+
+    # Reset stats
     bm = llm.engine.model_runner.block_manager
-    num_cached_after_first = len(bm.hash_to_block_id)
-    assert num_cached_after_first > 0, "Prefix cache should have entries after first batch"
+    bm.total_blocks_requested = 0
+    bm.total_blocks_hit = 0
 
-    # Batch 2: check cache hits
-    # We verify indirectly: hash_to_block_id should still contain prefix hashes
+    # Run all 3 together — 1st gets no hit, 2nd/3rd hit prefix
+    outputs = llm.generate(prompts, sp)
+    hit_rate = bm.cache_hit_rate()
+
+    print(f"\nCache hit rate for 3 same-prefix prompts: {hit_rate:.1%}")
+    for i, o in enumerate(outputs):
+        print(f"  Prompt {i}: {len(o['token_ids'])} output tokens")
+
+    # 2nd and 3rd prompts should have hit prefix cache
+    assert hit_rate > 0, f"Expected prefix cache hits, got hit_rate={hit_rate:.1%}"
+    assert len(outputs) == 3
+    for o in outputs:
+        assert len(o["token_ids"]) == 5
+
+
+@pytest.mark.timeout(300)
+def test_prefix_cache_hit_rate(llm):
+    """Prefix cache hit rate should be > 0 for same-prefix prompts in same batch."""
+    sp = SamplingParams(temperature=0.0, max_tokens=5)
+    prompts = [SYSTEM_PROMPT + q for q in QUERIES]
+
+    # Reset stats
+    bm = llm.engine.model_runner.block_manager
+    bm.total_blocks_requested = 0
+    bm.total_blocks_hit = 0
+
+    # All in same batch — 1st prompt no hit, 2nd/3rd hit prefix
     llm.generate(prompts, sp)
-    num_cached_after_second = len(bm.hash_to_block_id)
-    assert num_cached_after_second >= num_cached_after_first, (
-        "Cache entries should not decrease (shared prefix still referenced)"
-    )
+    hit_rate = bm.cache_hit_rate()
+
+    print(f"\nPrefix cache hit rate: {hit_rate:.1%}")
+    print(f"  Hits: {bm.total_blocks_hit} / Requested: {bm.total_blocks_requested}")
+
+    assert hit_rate > 0.0, f"Expected cache hits for same-prefix prompts, got {hit_rate:.1%}"
 
 
 @pytest.mark.timeout(300)
@@ -96,6 +126,32 @@ def test_prefix_cache_shared_blocks_refcount(llm):
     # Verify both produced output
     assert len(output_a["token_ids"]) == 5
     assert len(output_b["token_ids"]) == 5
+
+
+@pytest.mark.timeout(300)
+def test_deallocate_preserves_cache_then_eviction_cleans(llm):
+    """When sequences finish, blocks go to cached pool (hash preserved).
+    When memory is needed, cached blocks are evicted (hash cleaned).
+
+    With our 585-block pool, eviction won't happen in normal use.
+    So after generate(), hash entries should still exist for reuse.
+    """
+    sp = SamplingParams(temperature=0.0, max_tokens=5)
+    prompt = "This is a unique test prompt for deallocate. " * 5
+    bm = llm.engine.model_runner.block_manager
+
+    # Run once — blocks go to cached pool after seq finishes
+    llm.generate([prompt], sp)
+    assert len(bm.hash_to_block_id) > 0, "Hash entries should persist in cached pool"
+    assert len(bm.cached_blocks) > 0, "Blocks should be in cached pool, not freed"
+
+    # Run same prompt again — should hit prefix cache from cached pool
+    bm.total_blocks_requested = 0
+    bm.total_blocks_hit = 0
+    out = llm.generate([prompt], sp)[0]
+    hit_rate = bm.cache_hit_rate()
+    assert hit_rate > 0.0, f"Should hit prefix cache on 2nd run, got {hit_rate:.1%}"
+    assert len(out["token_ids"]) == 5
 
 
 @pytest.mark.timeout(300)

@@ -26,6 +26,16 @@ class BlockManager:
 
         # Prefix cache: hash_string -> block_id
         self.hash_to_block_id: Dict[str, int] = {}
+        # Reverse index: block_id -> hash_string (for cleanup on eviction)
+        self.block_to_hash: Dict[int, str] = {}
+
+        # Cached blocks: ref_count=0 but data preserved for prefix reuse
+        # Evicted only when free_blocks runs out
+        self.cached_blocks: List[int] = []
+
+        # Cache hit stats
+        self.total_blocks_requested: int = 0
+        self.total_blocks_hit: int = 0
 
     @property
     def num_free_blocks(self) -> int:
@@ -63,16 +73,10 @@ class BlockManager:
         """Allocate blocks for a sequence, reusing prefix cache hits.
 
         For each full block, check if hash hits in prefix cache:
-          - Hit: reuse block_id, ref_count++
+          - Hit + block in use (ref_count > 0): reuse, ref_count++
+          - Hit + block cached (ref_count == 0): re-activate from cached pool
           - Miss: allocate new block
         Last partial block always gets a new allocation.
-
-        Args:
-            token_ids: all prompt tokens for this sequence
-            block_table_layer: current block table for one layer (will be appended to)
-
-        Returns:
-            (block_table_layer updated, num_cached_tokens from prefix hits)
         """
         hashes = self.compute_hashes(token_ids)
         num_full_blocks = len(hashes)
@@ -83,37 +87,63 @@ class BlockManager:
         hit_count = 0  # consecutive hits from the start
         for h in hashes:
             if h in self.hash_to_block_id:
-                hit_count += 1
+                block_id = self.hash_to_block_id[h]
+                # Block still valid: either in-use or cached
+                if block_id in self.ref_counts or block_id in self.cached_blocks:
+                    hit_count += 1
+                else:
+                    break  # stale entry, treat as miss
             else:
                 break  # prefix must be consecutive; break at first miss
 
         # 2. Reuse hit blocks
         for i in range(hit_count):
             block_id = self.hash_to_block_id[hashes[i]]
+            if block_id in self.cached_blocks:
+                # Re-activate cached block
+                self.cached_blocks.remove(block_id)
+                self.ref_counts[block_id] = 1
+            else:
+                # Block already in use, increment ref_count
+                self.ref_counts[block_id] += 1
             block_table_layer.append(block_id)
-            self.ref_counts[block_id] += 1
         cached_tokens = hit_count * self.block_size
+
+        # Track hit rate
+        self.total_blocks_requested += num_full_blocks
+        self.total_blocks_hit += hit_count
 
         # 3. Allocate new blocks for the rest (misses + partial block)
         num_new_blocks = num_total_blocks - hit_count
-        if num_new_blocks > self.num_free_blocks:
-            raise RuntimeError(
-                f"Not enough blocks: need {num_new_blocks}, have {self.num_free_blocks}"
-            )
-        new_blocks = self.free_blocks[:num_new_blocks]
-        self.free_blocks = self.free_blocks[num_new_blocks:]
-        for b in new_blocks:
-            self.ref_counts[b] = 1
-        block_table_layer.extend(new_blocks)
+        if num_new_blocks > 0:
+            self._ensure_free_blocks(num_new_blocks)
+            new_blocks = self.free_blocks[:num_new_blocks]
+            self.free_blocks = self.free_blocks[num_new_blocks:]
+            for b in new_blocks:
+                self.ref_counts[b] = 1
+            block_table_layer.extend(new_blocks)
 
         return block_table_layer, cached_tokens
 
+    def _ensure_free_blocks(self, num_needed: int) -> None:
+        """Ensure enough free blocks, evicting cached blocks if necessary."""
+        while len(self.free_blocks) < num_needed and self.cached_blocks:
+            # Evict the oldest cached block
+            block_id = self.cached_blocks.pop(0)
+            # Clean up hash entries for evicted block
+            if block_id in self.block_to_hash:
+                h = self.block_to_hash.pop(block_id)
+                self.hash_to_block_id.pop(h, None)
+            self.free_blocks.append(block_id)
+        if len(self.free_blocks) < num_needed:
+            raise RuntimeError(
+                f"Not enough blocks: need {num_needed}, "
+                f"have {len(self.free_blocks)} free + {len(self.cached_blocks)} cached"
+            )
+
     def allocate(self, num_blocks: int) -> List[int]:
         """Allocate `num_blocks` fresh blocks. No prefix cache lookup."""
-        if num_blocks > self.num_free_blocks:
-            raise RuntimeError(
-                f"Not enough blocks: need {num_blocks}, have {self.num_free_blocks}"
-            )
+        self._ensure_free_blocks(num_blocks)
         blocks = self.free_blocks[:num_blocks]
         self.free_blocks = self.free_blocks[num_blocks:]
         for b in blocks:
@@ -121,14 +151,24 @@ class BlockManager:
         return blocks
 
     def deallocate(self, block_ids: List[int]) -> None:
-        """Release blocks back to free pool (M3: decrement ref_count first)."""
+        """Release blocks: decrement ref_count. When ref_count hits 0,
+        move block to cached_blocks (data preserved for prefix reuse).
+        Cached blocks are evicted only when free_blocks runs out.
+        """
         for b in block_ids:
             if b not in self.ref_counts:
                 continue
             self.ref_counts[b] -= 1
             if self.ref_counts[b] == 0:
                 del self.ref_counts[b]
-                self.free_blocks.append(b)
+                # Don't free immediately — keep in cached pool for reuse
+                self.cached_blocks.append(b)
+
+    def cache_hit_rate(self) -> float:
+        """Return prefix cache hit rate (hit blocks / total requested)."""
+        if self.total_blocks_requested == 0:
+            return 0.0
+        return self.total_blocks_hit / self.total_blocks_requested
 
     def num_blocks_needed(self, num_tokens: int) -> int:
         """How many blocks needed to cache `num_tokens` tokens?"""
@@ -155,15 +195,11 @@ class BlockManager:
         """Register full blocks into prefix cache after prefill.
 
         Called AFTER forward pass completes, when KV values are written to cache.
-        For each full block, register hash -> block_id.
-
-        Args:
-            token_ids: prompt tokens for this sequence
-            block_table_layer: the block table for one layer (list of block_ids)
+        For each full block, register hash -> block_id and block_id -> hash.
         """
         hashes = self.compute_hashes(token_ids)
-        num_full_blocks = len(hashes)
-        for i in range(num_full_blocks):
+        for i in range(len(hashes)):
             block_id = block_table_layer[i]
             self.hash_to_block_id[hashes[i]] = block_id
+            self.block_to_hash[block_id] = hashes[i]
             
