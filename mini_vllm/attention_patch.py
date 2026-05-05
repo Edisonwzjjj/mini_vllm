@@ -11,13 +11,15 @@ from transformers.models.qwen3.modeling_qwen3 import (
 class PageContext:
     """Runtime context set by ModelRunner before each forward call."""
     kv_cache: torch.Tensor      # (num_layers, num_blocks, 2, num_kv_heads, block_size, head_dim)
-    block_table: list = None    # List[int] — used for single-seq decode only
-    block_tables: list = None   # List[List[int]] — per-seq block tables for batched decode
+    block_table: list    # List[int] — used for single-seq decode only
+    block_tables: list  # List[List[int]] — per-seq block tables for batched decode
     slot_mapping: list           # List[int] — flat list of slot indices
     num_cached_tokens: int = 0  # used for prefill
-    num_cached_after: list = None  # List[int] — per-seq cached counts for batched decode
+    num_cached_after: list  # List[int] — per-seq cached counts for batched decode
     is_prefill: bool = True
-    attn_mask: torch.Tensor = None   # (total_len, total_len) block-diagonal causal mask for prefill
+    attn_mask: torch.Tensor # (total_len, total_len) block-diagonal causal mask for prefill 
+    prefix_lengths: list 
+    suffix_lengths: list
 
 
 paged_ctx = PageContext()
@@ -66,9 +68,11 @@ def paged_attention_forward(
     num_cached = paged_ctx.num_cached_tokens
     is_prefill = paged_ctx.is_prefill
     block_size = kv_cache.shape[4]               # block_size dim
-
+    has_prefix_hit = getattr(paged_ctx, 'prefix_lengths', None) is not None and any(
+        pl > 0 for pl in (paged_ctx.prefix_lengths or [])
+    )
     if is_prefill:
-        # --- Write K, V into cache via slot_mapping ---
+        # --- Write suffix K/V to cache (both paths need this) ---
         slots = torch.tensor(slot_mapping, device=kv_cache.device)
         K_write = key_states[0].transpose(0, 1)      # [seq_len, num_kv_heads, head_dim]
         V_write = value_states[0].transpose(0, 1)
@@ -79,9 +83,77 @@ def paged_attention_forward(
             kv_cache[layer_idx, bid, 0, :, off, :] = K_write[t]   # K
             kv_cache[layer_idx, bid, 1, :, off, :] = V_write[t]   # V
 
-        # Prefill: attention uses the just-computed K, V (they ARE the full sequence)
-        K_attn = key_states
-        V_attn = value_states
+        if has_prefix_hit:
+            # ---- SUFFIX PREFILL: read ALL KV from cache, per-sequence SDPA ----
+            prefix_lens = paged_ctx.prefix_lengths
+            suffix_lens = paged_ctx.suffix_lengths
+            bt_list = paged_ctx.block_tables
+
+            attn_outputs = []
+            q_offset = 0
+            for i in range(len(prefix_lens)):
+                prefix_len = prefix_lens[i]
+                suffix_len = suffix_lens[i]
+                total_len = prefix_len + suffix_len
+
+                # Extract Q for this sequence
+                Q_i = query_states[:, :, q_offset:q_offset+suffix_len, :]
+                # (1, num_heads, suffix_len, head_dim)
+
+                # Read ALL KV from cache using block_table
+                bt = bt_list[i]
+                K_blocks = kv_cache[layer_idx, bt, 0]
+                V_blocks = kv_cache[layer_idx, bt, 1]
+                K_full = K_blocks.permute(1, 0, 2, 3).reshape(
+                    num_kv_heads, -1, self.head_dim
+                )[:, :total_len, :]
+                V_full = V_blocks.permute(1, 0, 2, 3).reshape(
+                    num_kv_heads, -1, self.head_dim
+                )[:, :total_len, :]
+                K_i = K_full.unsqueeze(0)  # (1, num_kv_heads, total_len, head_dim)
+                V_i = V_full.unsqueeze(0)
+
+                # GQA expand
+                K_exp = repeat_kv(K_i, self.num_key_value_groups)
+                V_exp = repeat_kv(V_i, self.num_key_value_groups)
+
+                # Per-sequence mask: suffix attends to all prefix + causal within suffix
+                seq_mask = torch.full(
+                    (1, 1, suffix_len, total_len), float('-inf'), device=kv_cache.device
+                )
+                seq_mask[0, 0, :, :prefix_len] = 0.0  # attend to prefix
+                causal = torch.tril(torch.ones(suffix_len, suffix_len, device=kv_cache.device)).bool()
+                seq_mask[0, 0, :, prefix_len:][causal] = 0.0  # causal within suffix
+
+                attn_out = F.scaled_dot_product_attention(
+                    Q_i, K_exp, V_exp, attn_mask=seq_mask
+                )  # (1, num_heads, suffix_len, head_dim)
+                attn_outputs.append(attn_out)
+                q_offset += suffix_len
+
+            attn_output = torch.cat(attn_outputs, dim=2)
+            # (1, num_heads, total_suffix_len, head_dim)
+        else:
+            # ---- ORIGINAL PREFILL: use just-computed K/V ----
+            K_attn = key_states
+            V_attn = value_states
+
+            K_expanded = repeat_kv(K_attn, self.num_key_value_groups)
+            V_expanded = repeat_kv(V_attn, self.num_key_value_groups)
+
+            if paged_ctx.attn_mask is not None:
+                mask = paged_ctx.attn_mask.unsqueeze(0).unsqueeze(0).expand(
+                    -1, num_heads, -1, -1
+                )
+                attn_output = F.scaled_dot_product_attention(
+                    query_states, K_expanded, V_expanded,
+                    attn_mask=mask,
+                )
+            else:
+                attn_output = F.scaled_dot_product_attention(
+                    query_states, K_expanded, V_expanded,
+                    is_causal=True,
+                )
     else:
         # --- Batched decode: write K/V, then padded batch SDPA ---
         slots = torch.tensor(slot_mapping, device=kv_cache.device)
@@ -112,26 +184,17 @@ def paged_attention_forward(
         V_attn = V_batch
 
     # ========== 4. GQA expand + Attention ==========
-    K_expanded = repeat_kv(K_attn, self.num_key_value_groups)
-    V_expanded = repeat_kv(V_attn, self.num_key_value_groups)
-
-    if is_prefill:
-        if paged_ctx.attn_mask is not None:
-            mask = paged_ctx.attn_mask.unsqueeze(0).unsqueeze(0).expand(
-                -1, num_heads, -1, -1
-            )
-            attn_output = F.scaled_dot_product_attention(
-                query_states, K_expanded, V_expanded,
-                attn_mask=mask,
-            )
-        else:
-            attn_output = F.scaled_dot_product_attention(
-                query_states, K_expanded, V_expanded,
-                is_causal=True,
-            )
+    if is_prefill and has_prefix_hit:
+        # Already computed attn_output in suffix prefill path above
+        pass
+    elif is_prefill:
+        # Original prefill: already computed above
+        pass
     else:
-        # Decode: mask out padding positions in padded KV
-        # Build mask: (bsz, 1, 1, max_cached), 0 = attend, -inf = padding
+        # Decode: GQA expand + padded batch SDPA
+        K_expanded = repeat_kv(K_attn, self.num_key_value_groups)
+        V_expanded = repeat_kv(V_attn, self.num_key_value_groups)
+
         decode_mask = torch.zeros(bsz, 1, 1, max_cached, device=kv_cache.device)
         for i in range(bsz):
             decode_mask[i, 0, 0, num_cached_list[i]:] = float('-inf')
