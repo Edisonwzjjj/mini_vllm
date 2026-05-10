@@ -52,11 +52,12 @@ class LLMEngine:
 
         seqs = scheduler_output.seqs
         finished = []
-
         if scheduler_output.is_prefill:
             # Batched prefill: returns one logits per sequence
             logits_list = self.model_runner.run_prefill(seqs)
             for seq, logits in zip(seqs, logits_list):
+                if not seq.is_prefill_finished:
+                    continue  # wait for next step to start decoding
                 next_token = sample_token(logits, sampling_params)
                 seq.output_token_ids.append(next_token)
                 if (next_token == self.model_runner.eos_token_id
@@ -68,6 +69,13 @@ class LLMEngine:
         else:
             # Batched decode: returns one logits per sequence
             logits_list = self.model_runner.run_decode(seqs)
+            if logits_list is None:
+                victim = self.scheduler.preempt_one()
+                if victim is None:
+                    raise RuntimeError("OOM: no sequence to preempt")
+                self._free_seq_resources(victim)
+                print(f"[PREEMPT] seq_id={victim.seq_id}, released blocks")
+                return []
             for seq, logits in zip(seqs, logits_list):
                 next_token = sample_token(logits, sampling_params)
                 seq.output_token_ids.append(next_token)

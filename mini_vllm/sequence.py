@@ -32,6 +32,9 @@ class Sequence:
         self.block_size = block_size
         self.num_layers = num_layers
         self.status = SequenceStatus.WAITING
+        
+        self.num_prefill_tokens: int = 0
+        
 
     @property
     def token_ids(self) -> List[int]:
@@ -52,6 +55,10 @@ class Sequence:
     @property
     def last_token_id(self) -> int:
         return self.token_ids[-1]
+    
+    @property
+    def is_prefill_finished(self) -> bool:
+        return self.num_prefill_tokens >= len(self.prompt_token_ids)
 
     def is_finished(self) -> bool:
         return self.status == SequenceStatus.FINISHED

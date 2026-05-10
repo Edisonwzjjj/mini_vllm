@@ -149,6 +149,17 @@ class BlockManager:
         for b in blocks:
             self.ref_counts[b] = 1
         return blocks
+    
+    def try_allocate(self, num_blocks: int) -> Optional[List[int]]:
+        """Try to allocate without raising. Returns None if not enough blocks."""
+        if len(self.free_blocks) + len(self.cached_blocks) < num_blocks:
+            return None
+        self._ensure_free_blocks(num_blocks)
+        blocks = self.free_blocks[:num_blocks]
+        self.free_blocks = self.free_blocks[num_blocks:]
+        for b in blocks:
+            self.ref_counts[b] = 1
+        return blocks
 
     def deallocate(self, block_ids: List[int]) -> None:
         """Release blocks: decrement ref_count. When ref_count hits 0,

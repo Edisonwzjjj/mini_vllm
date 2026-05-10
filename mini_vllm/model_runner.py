@@ -32,6 +32,7 @@ class ModelRunner:
         self.block_manager = BlockManager(self.block_size, num_blocks)
         apply_attention_patch(self.model)
 
+
     def allocate_kv_cache(self):
         """Allocate per-layer paged KV cache tensors.
 
@@ -68,15 +69,31 @@ class ModelRunner:
         prefill_seqs = []  # sequences that need suffix prefill
 
         for seq in seqs:
-            bt_layer, cached_tokens = self.block_manager.allocate_with_prefix(
-                seq.prompt_token_ids, seq.block_table[0]
-            )
-            for layer in range(1, self.num_layers):
-                seq.block_table[layer] = list(bt_layer)
-            seq.block_table[0] = bt_layer
+            chunk_start = seq.num_prefill_tokens
+            # chunk_end: 这轮最多 prefill 到哪
+            # TODO: 多 seq 时按剩余 budget 分配，目前先按 max_num_batched_tokens
+            chunk_end = min(seq.num_prompt_tokens, chunk_start + self.max_num_batched_tokens)
 
-            prefix_len = cached_tokens
-            suffix_len = seq.num_prompt_tokens - prefix_len
+            if chunk_start == 0:
+                # 第一轮 chunk: 可以命中跨序列 prefix cache
+                bt_layer, cached_tokens = self.block_manager.allocate_with_prefix(
+                    seq.prompt_token_ids[:chunk_end], seq.block_table[0]
+                )
+                for layer in range(1, self.num_layers):
+                    seq.block_table[layer] = list(bt_layer)
+                seq.block_table[0] = bt_layer
+                prefix_len = cached_tokens
+            else:
+                # 续接 chunk: block_table 里已有之前的 block，只需追加新 block
+                num_blocks_needed = self.block_manager.num_blocks_needed(chunk_end)
+                cur_blocks = len(seq.block_table[0])
+                if cur_blocks < num_blocks_needed:
+                    new_blocks = self.block_manager.allocate(num_blocks_needed - cur_blocks)
+                    for layer in range(self.num_layers):
+                        seq.block_table[layer].extend(new_blocks)
+                prefix_len = chunk_start  # 之前的 token 都已有 KV，等价于 prefix
+
+            suffix_len = chunk_end - max(prefix_len, chunk_start)
 
             # When suffix_len=0 (all tokens cached), we still need logits at
             # the last position. Force at least 1 suffix token through prefill
@@ -87,13 +104,13 @@ class ModelRunner:
 
             prefill_seqs.append(seq)
 
-            suffix_token_ids = seq.prompt_token_ids[prefix_len:]
-            suffix_positions = list(range(prefix_len, seq.num_prompt_tokens))
+            suffix_token_ids = seq.prompt_token_ids[max(prefix_len, chunk_start):chunk_end]
+            suffix_positions = list(range(max(prefix_len, chunk_start), chunk_end))
 
             full_slot_mapping = self.block_manager.get_slot_mapping(
-                bt_layer, seq.num_prompt_tokens
+                seq.block_table[0], chunk_end
             )
-            suffix_slot_mapping = full_slot_mapping[prefix_len:]
+            suffix_slot_mapping = full_slot_mapping[max(prefix_len, chunk_start):chunk_end]
 
             all_input_ids.extend(suffix_token_ids)
             all_position_ids.extend(suffix_positions)
@@ -146,8 +163,11 @@ class ModelRunner:
 
         # 5. Update num_cached_tokens & register hashes AFTER forward
         for seq in prefill_seqs:
-            seq.num_cached_tokens = seq.num_prompt_tokens
-            self.block_manager.hash_blocks(seq.prompt_token_ids, seq.block_table[0])
+            chunk_end = min(seq.num_prompt_tokens, seq.num_prefill_tokens + self.max_num_batched_tokens)
+            seq.num_cached_tokens = chunk_end
+            seq.num_prefill_tokens = chunk_end
+            # Only hash full blocks that have been computed so far
+            self.block_manager.hash_blocks(seq.prompt_token_ids[:chunk_end], seq.block_table[0])
 
         # 6. Extract last-position logits for each prefill sequence
         logits = outputs.logits  # (1, total_suffix_len, vocab_size)
@@ -169,7 +189,9 @@ class ModelRunner:
             num_blocks_needed = self.block_manager.num_blocks_needed(total_tokens_after)
             cur_blocks = len(seq.block_table[0])
             if cur_blocks < num_blocks_needed:
-                new_blocks = self.block_manager.allocate(num_blocks_needed - cur_blocks)
+                new_blocks = self.block_manager.try_allocate(num_blocks_needed - cur_blocks)
+                if new_blocks is None:
+                    return []  # signal OOM to caller for potential preemption
                 for layer in range(self.num_layers):
                     seq.block_table[layer].extend(new_blocks)
 
