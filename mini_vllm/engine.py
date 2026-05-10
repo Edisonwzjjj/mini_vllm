@@ -44,30 +44,48 @@ class LLMEngine:
         for layer in range(self.model_runner.num_layers):
             self.model_runner.block_manager.deallocate(seq.block_table[layer])
 
-    def step(self, sampling_params: SamplingParams):
-        """One iteration: schedule → forward → sample → append → check done."""
+    def _sample_and_append(self, seq, logits, sampling_params):
+        """Sample a token, append to seq, return StepOutput dict."""
+        token_id = sample_token(logits, sampling_params)
+        seq.output_token_ids.append(token_id)
+
+        is_finished = (
+            token_id == self.model_runner.eos_token_id
+            or seq.num_output_tokens >= sampling_params.max_tokens
+        )
+        if is_finished:
+            seq.mark_finished()
+            self.scheduler.postprocess(seq)
+            self._free_seq_resources(seq)
+
+        text = self.model_runner.tokenizer.decode([token_id], skip_special_tokens=True)
+        return {
+            "seq_id": seq.seq_id,
+            "token_id": token_id,
+            "text": text,
+            "finished": is_finished,
+        }
+
+    def step(self, sampling_params: SamplingParams) -> list[dict]:
+        """One iteration: schedule → forward → sample → append.
+
+        Returns list of {seq_id, token_id, text, finished} for each token
+        produced this step. Empty list if no work to do.
+        """
         scheduler_output = self.scheduler.schedule()
         if not scheduler_output.seqs:
-            return []  # all finished
+            return []
 
         seqs = scheduler_output.seqs
-        finished = []
+        results = []
+
         if scheduler_output.is_prefill:
-            # Batched prefill: returns one logits per sequence
             logits_list = self.model_runner.run_prefill(seqs)
             for seq, logits in zip(seqs, logits_list):
                 if not seq.is_prefill_finished:
-                    continue  # wait for next step to start decoding
-                next_token = sample_token(logits, sampling_params)
-                seq.output_token_ids.append(next_token)
-                if (next_token == self.model_runner.eos_token_id
-                        or seq.num_output_tokens >= sampling_params.max_tokens):
-                    seq.mark_finished()
-                    finished.append(seq)
-                    self.scheduler.postprocess(seq)
-                    self._free_seq_resources(seq)
+                    continue
+                results.append(self._sample_and_append(seq, logits, sampling_params))
         else:
-            # Batched decode: returns one logits per sequence
             logits_list = self.model_runner.run_decode(seqs)
             if logits_list is None:
                 victim = self.scheduler.preempt_one()
@@ -77,39 +95,18 @@ class LLMEngine:
                 print(f"[PREEMPT] seq_id={victim.seq_id}, released blocks")
                 return []
             for seq, logits in zip(seqs, logits_list):
-                next_token = sample_token(logits, sampling_params)
-                seq.output_token_ids.append(next_token)
-                if (next_token == self.model_runner.eos_token_id
-                        or seq.num_output_tokens >= sampling_params.max_tokens):
-                    seq.mark_finished()
-                    finished.append(seq)
-                    self.scheduler.postprocess(seq)
-                    self._free_seq_resources(seq)
+                results.append(self._sample_and_append(seq, logits, sampling_params))
 
-        return finished
+        return results
 
     def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[dict]:
         """Tokenize prompts → run engine loop → return results."""
-        # 1. Tokenize and create Sequence objects
-        seqs = []
-        for i, prompt in enumerate(prompts):
-            prompt_token_ids = self.model_runner.tokenizer.encode(prompt)
-            seq = Sequence(
-                seq_id=i,
-                prompt_token_ids=prompt_token_ids,
-                block_size=self.model_runner.block_size,
-                num_layers=self.model_runner.num_layers,
-            )
-            seqs.append(seq)
-
-        # 2. Add all sequences to the scheduler ONCE
+        seqs = self._create_sequences(prompts)
         self.scheduler.add_seqs(seqs)
 
-        # 3. Main loop until all sequences are finished
         while not all(seq.is_finished() for seq in seqs):
             self.step(sampling_params)
 
-        # 3. Convert output token IDs back to text
         outputs = []
         for seq in seqs:
             output_text = self.model_runner.tokenizer.decode(
@@ -120,6 +117,33 @@ class LLMEngine:
                 "token_ids": seq.output_token_ids,
             })
         return outputs
+
+    def generate_stream(self, prompts: list[str], sampling_params: SamplingParams):
+        """Tokenize prompts → run engine loop → yield each token as it's produced.
+
+        Yields {seq_id, token_id, text, finished} dicts, one per token per sequence.
+        """
+        seqs = self._create_sequences(prompts)
+        self.scheduler.add_seqs(seqs)
+
+        while not all(seq.is_finished() for seq in seqs):
+            step_results = self.step(sampling_params)
+            for r in step_results:
+                yield r
+
+    def _create_sequences(self, prompts: list[str]) -> list[Sequence]:
+        """Tokenize prompts and create Sequence objects."""
+        seqs = []
+        for i, prompt in enumerate(prompts):
+            prompt_token_ids = self.model_runner.tokenizer.encode(prompt)
+            seq = Sequence(
+                seq_id=i,
+                prompt_token_ids=prompt_token_ids,
+                block_size=self.model_runner.block_size,
+                num_layers=self.model_runner.num_layers,
+            )
+            seqs.append(seq)
+        return seqs
 
 
 class LLM:
@@ -139,3 +163,11 @@ class LLM:
 
     def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[dict]:
         return self.engine.generate(prompts, sampling_params)
+
+    def generate_stream(self, prompts: list[str], sampling_params: SamplingParams):
+        """Yield each token as it's produced. Usage:
+
+            for chunk in llm.generate_stream(["Hello"], sp):
+                print(chunk["text"], end="", flush=True)
+        """
+        return self.engine.generate_stream(prompts, sampling_params)
