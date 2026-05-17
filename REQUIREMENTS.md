@@ -169,40 +169,74 @@ for o in outputs:
 
 ---
 
-### 🎯 M3：Prefix Cache（3-4 天）
+### 🎯 M3：Prefix Cache → Radix Tree（已完成）
 
-**目标**：相同前缀的请求不重复 prefill，吞吐进一步提升。
+**目标**：用 Radix Tree 替换 hash chain，实现前缀缓存 + LRU 驱逐 + Cache-Aware 调度。
 
-**新增实现**：
-- `BlockManager.compute_hash`：对每个满 block 算 hash（用 `xxhash` 或 `hashlib`）
-- `hash_to_block_id`：dict 索引
-- `can_allocate`：先查命中多少 block
-- `allocate`：复用命中的 block（`ref_count++`），剩下的新分配
-- `deallocate`：`ref_count--`，归 0 才回收
-- `hash_blocks`：prefill 完成后注册新 block 的 hash
+**已实现**：
+- `RadixTreeNode`：parent/children(block_tokens tuple 做 key)/block_id/ref_count/last_access_time
+- `RadixTree`：match_prefix / insert / evict（级联清理） / match_prefix_ratio
+- `BlockManager`：radix_tree 替换 hash_to_block_id，eviction_heap (O(log N))，insert_blocks 替换 hash_blocks
+- `Scheduler`：cache-aware 排序（按 match_prefix_ratio 降序），block_manager 引用
+- 修复 `preempt_one` bug（先 deallocate 再清 block_table）
 
-**验收标准**：
-1. 发 3 条相同前缀的 prompt，第 2、3 条的 prefill 实际计算 token 数 < 第 1 条
-2. 打印 prefix cache 命中率（命中 block 数 / 总需要 block 数）
-3. 用一个 200 token 的 system prompt + 10 条不同的 user query，benchmark 吞吐应该比 M2 至少快 1.5x
+**关键认知**：
+- **Block 粒度下 radix tree 和 hash chain 命中率完全相同**（benchmark 验证）
+- Radix tree 的真正优势需要 token 粒度（split_node）+ EAGLE bigram key
+- LRU 驱逐 > FIFO 驱逐：热门 system prompt 不被误驱
 
-**关键决策点**：
-- hash 怎么形成"前缀链"？（提示：`hash_i = hash(prefix_hash, block_i_tokens)`）
-- 命中的 block 一定还在显存吗？被 evict 怎么办？
-- `ref_count` 什么时候 ++、什么时候 --？写错一次就泄漏 / use-after-free
-
-**你会撞的墙**：
-- 两个序列共享 block 5，序列 A 结束 deallocate 时把 block 5 也释放了 → 序列 B 崩溃（ref_count 没正确处理）
-- hash 冲突没用 token_ids 做二次验证 → 极小概率读到错误数据
-- 满 block 才能 hash，**最后那个不满的 block 不算**（这是 nano-vllm 的设计，想想为什么）
+**验收**：
+- 所有 34 个测试通过（含 19 个新 radix tree 测试）
+- Benchmark：3/5/10 用户多轮对话 hit rate = hash chain hit rate
 
 ---
 
-### 🌟 M4（可选挑战）：抢占 / Chunked Prefill / 流式输出
-做完 M1-M3 还有热情？挑一个：
-- **抢占**：decode 时显存不足，把最新进来的 sequence 踢回 waiting，KV 释放
-- **Chunked Prefill**：超长 prompt 分段 prefill
-- **流式输出**：`generate_stream()` yield token
+### 🌟 M4（已完成）：抢占 / Chunked Prefill / 流式输出
+
+**已实现**：
+- 抢占：preempt_one (LIFO) + _free_seq_resources
+- Chunked Prefill：max_num_batched_tokens 限制 + 续接 chunk
+- 流式输出：generate_stream() yield token
+
+---
+
+### 🌟 M5：EAGLE 投机解码（进行中）
+
+**目标**：实现 EAGLE-style 树形投机解码，理解 draft model / tree attention / greedy 验证 / radix tree draft KV 复用。
+
+**简化约定**：
+- Greedy 验证（不做 stochastic sampling）
+- 小 draft tree：top-2, depth 3（最多 7 draft token + 1 bonus）
+- 纯 PyTorch tree attention（无自定义 CUDA kernel）
+- Block 粒度（不做 token 粒度 split_node）
+- 单序列先行
+
+**EAGLE Decode 循环**：
+```
+1. DRAFT:   Draft model（1 层 + fc 投影）生成树形候选 token
+2. VERIFY:  Target model 一次 forward 验证所有 draft token（tree attention）
+3. POST:    BFS 遍历树，greedy 接受匹配的 token，拒绝的释放 KV
+4. EXTEND:  用 accepted token 跑 draft model，准备下一轮输入
+```
+
+**新增文件**：
+- `draft_model.py`：EAGLE draft model（1 层，fc=Linear(hidden*2, hidden)，共享 embed+lm_head）
+- `draft_tree.py`：DraftTree 数据类、tree mask 构建、greedy 验证
+- `eagle_runner.py`：draft→verify→post_verify→draft_extend 循环
+
+**修改文件**：
+- `attention_patch.py`：加 tree verify 分支（tree_mask 替代 causal mask）
+- `model_runner.py`：hidden state 捕获、run_verify、draft model 初始化
+- `engine.py`：EAGLE decode 路径
+- `sequence.py`：draft 字段（draft_tokens, draft_parent_indices, hidden_state）
+- `config.py`：EAGLE 配置（enable_eagle, eagle_topk, eagle_spec_steps）
+- `block_manager.py`：DraftRadixTree（bigram key 复用 draft KV）
+
+**验收标准**：
+1. Draft tree mask 正确：每个 draft token 只 attend 到祖先路径
+2. Greedy 验证：accepted tokens 与 target model 独立 greedy decode 一致
+3. EAGLE decode 吞吐 > 原始 decode（每个 step 产出 >1 token）
+4. Draft KV 复用：相同 bigram 在下一轮 draft 时命中 radix tree
 
 ---
 

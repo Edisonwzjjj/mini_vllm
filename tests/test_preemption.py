@@ -2,6 +2,7 @@
 
 import pytest
 from mini_vllm import LLM, SamplingParams
+from mini_vllm.block_manager import RadixTree
 
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
@@ -22,17 +23,10 @@ def _shrink_free_blocks(llm, keep=5):
 def _reset_blocks(llm):
     """Restore block_manager to a clean state between tests."""
     bm = llm.engine.model_runner.block_manager
-    # Collect all blocks that aren't in ref_counts
-    all_blocks = set(range(bm.num_blocks))
-    in_use = set(bm.ref_counts.keys())
-    cached = set(bm.cached_blocks)
-    free = set(bm.free_blocks)
-    # Reset everything
-    bm.free_blocks = sorted(all_blocks - in_use - cached)
-    bm.cached_blocks = []
-    bm.hash_to_block_id = {}
-    bm.block_to_hash = {}
-    bm.ref_counts = {}
+    # Reset block manager to initial state
+    bm.free_blocks = list(range(bm.num_blocks))
+    bm.radix_tree = RadixTree(bm.block_size)
+    bm.block_id_to_node = {}
     bm.total_blocks_requested = 0
     bm.total_blocks_hit = 0
 
@@ -112,9 +106,12 @@ def test_preempt_one_frees_blocks(llm):
     assert victim is seq
     assert seq.num_cached_tokens == 0
     assert seq.output_token_ids == []
-    assert seq.block_table[0] == []
-    # Blocks should be in cached pool (deallocated via _free_seq_resources in engine)
-    # Here we just tested scheduler's part
+    # block_table is NOT cleared by preempt_one — it's cleared by _free_seq_resources
+    assert seq.block_table[0] != [], "block_table not yet cleared (preempt_one doesn't clear it)"
+
+    # Now free resources (as engine.step does after preempt)
+    llm.engine._free_seq_resources(victim)
+    assert seq.block_table[0] == [], "block_table cleared after _free_seq_resources"
 
 
 @pytest.mark.timeout(300)

@@ -37,12 +37,14 @@ class LLMEngine:
             max_num_batched_tokens=config.max_num_batched_tokens,
             gpu_memory_utilization=config.gpu_memory_utilization,
         )
-        self.scheduler = Scheduler(config.max_num_seqs, config.max_num_batched_tokens)
+        self.scheduler = Scheduler(config.max_num_seqs, config.max_num_batched_tokens,
+                                  self.model_runner.block_manager)
 
     def _free_seq_resources(self, seq: Sequence) -> None:
-        """Deallocate a finished sequence's blocks."""
+        """Deallocate a sequence's blocks and clear its block_table."""
         for layer in range(self.model_runner.num_layers):
             self.model_runner.block_manager.deallocate(seq.block_table[layer])
+            seq.block_table[layer] = []
 
     def _sample_and_append(self, seq, logits, sampling_params):
         """Sample a token, append to seq, return StepOutput dict."""

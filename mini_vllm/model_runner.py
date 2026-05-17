@@ -166,8 +166,8 @@ class ModelRunner:
             chunk_end = min(seq.num_prompt_tokens, seq.num_prefill_tokens + self.max_num_batched_tokens)
             seq.num_cached_tokens = chunk_end
             seq.num_prefill_tokens = chunk_end
-            # Only hash full blocks that have been computed so far
-            self.block_manager.hash_blocks(seq.prompt_token_ids[:chunk_end], seq.block_table[0])
+            # Only insert full blocks that have been computed so far
+            self.block_manager.insert_blocks(seq.prompt_token_ids[:chunk_end], seq.block_table[0])
 
         # 6. Extract last-position logits for each prefill sequence
         logits = outputs.logits  # (1, total_suffix_len, vocab_size)

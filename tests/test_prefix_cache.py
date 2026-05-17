@@ -140,10 +140,9 @@ def test_deallocate_preserves_cache_then_eviction_cleans(llm):
     prompt = "This is a unique test prompt for deallocate. " * 5
     bm = llm.engine.model_runner.block_manager
 
-    # Run once — blocks go to cached pool after seq finishes
+    # Run once — blocks stay in radix tree after seq finishes (ref_count=0 but cached)
     llm.generate([prompt], sp)
-    assert len(bm.hash_to_block_id) > 0, "Hash entries should persist in cached pool"
-    assert len(bm.cached_blocks) > 0, "Blocks should be in cached pool, not freed"
+    assert len(bm.block_id_to_node) > 0, "Tree nodes should persist in radix tree"
 
     # Run same prompt again — should hit prefix cache from cached pool
     bm.total_blocks_requested = 0
