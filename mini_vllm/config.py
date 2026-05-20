@@ -11,3 +11,6 @@ class EngineConfig:
     max_num_batched_tokens: int = 2048
     gpu_memory_utilization: float = 0.5
     dtype: str = "auto"  # "auto" | "float16" | "float32"
+    enable_eagle: bool = False
+    eagle_draft_len: int = 4
+    eagle_verify_greedy_only: bool = True

@@ -52,7 +52,7 @@ def test_prefill_slot_mapping(model_runner):
     seq = Sequence(seq_id=0, prompt_token_ids=prompt_ids, block_size=16, num_layers=28)
 
     # Run prefill
-    logits = model_runner.run_prefill(seq)
+    logits = model_runner.run_prefill([seq])[0]
 
     # Check: num_cached_tokens should equal prompt length
     print(f"[CHECK] num_cached_tokens={seq.num_cached_tokens}, prompt_len={len(prompt_ids)}")
@@ -79,7 +79,7 @@ def test_prefill_slot_mapping(model_runner):
 
     # Check: logits shape
     print(f"[CHECK] logits shape={logits.shape}")
-    assert logits.shape == (1, 151936), f"Unexpected logits shape: {logits.shape}"
+    assert logits.shape == (model_runner.model.config.vocab_size,), f"Unexpected logits shape: {logits.shape}"
 
     # Check: first generated token matches HF greedy
     next_token = logits.argmax(-1).item()
@@ -97,7 +97,7 @@ def test_prefill_then_decode_tokens(model_runner):
     seq = Sequence(seq_id=1, prompt_token_ids=prompt_ids, block_size=16, num_layers=28)
 
     # Prefill
-    logits = model_runner.run_prefill(seq)
+    logits = model_runner.run_prefill([seq])[0]
     next_token = logits.argmax(-1).item()
     seq.output_token_ids.append(next_token)
     print(f"[PREFILL] token {next_token} = '{tokenizer.decode([next_token])}'")
@@ -109,7 +109,7 @@ def test_prefill_then_decode_tokens(model_runner):
         print(f"[DECODE step={step}] num_cached={seq.num_cached_tokens}, "
               f"num_tokens={seq.num_tokens}, position={seq.num_tokens - 1}")
 
-        logits = model_runner.run_decode(seq)
+        logits = model_runner.run_decode([seq])[0]
         next_token = logits.argmax(-1).item()
         seq.output_token_ids.append(next_token)
         generated.append(next_token)
@@ -134,7 +134,7 @@ def test_decode_position_ids(model_runner):
     prompt_ids = tokenizer.encode("Hello")
     seq = Sequence(seq_id=2, prompt_token_ids=prompt_ids, block_size=16, num_layers=28)
 
-    logits = model_runner.run_prefill(seq)
+    logits = model_runner.run_prefill([seq])[0]
     seq.output_token_ids.append(logits.argmax(-1).item())
 
     # After prefill: num_cached=prompt_len, num_tokens=prompt_len+1
@@ -153,7 +153,7 @@ def test_decode_position_ids(model_runner):
     # Run decode and check position progression
     for step in range(3):
         pos_before = seq.num_tokens - 1
-        logits = model_runner.run_decode(seq)
+        logits = model_runner.run_decode([seq])[0]
         seq.output_token_ids.append(logits.argmax(-1).item())
         pos_after = seq.num_tokens - 1
         print(f"[POS] Decode step {step}: position_before={pos_before}, position_after={pos_after}")
@@ -172,7 +172,7 @@ def test_block_allocation_across_boundary(model_runner):
     prompt_ids = tokenizer.encode("Hello")  # likely 1-2 tokens
     seq = Sequence(seq_id=3, prompt_token_ids=prompt_ids, block_size=16, num_layers=28)
 
-    logits = model_runner.run_prefill(seq)
+    logits = model_runner.run_prefill([seq])[0]
     seq.output_token_ids.append(logits.argmax(-1).item())
 
     blocks_after_prefill = len(seq.block_table[0])
@@ -181,7 +181,7 @@ def test_block_allocation_across_boundary(model_runner):
 
     # Decode until we cross block boundary (need >16 cached tokens)
     for step in range(20):
-        logits = model_runner.run_decode(seq)
+        logits = model_runner.run_decode([seq])[0]
         seq.output_token_ids.append(logits.argmax(-1).item())
 
     blocks_after = len(seq.block_table[0])
@@ -203,14 +203,14 @@ def test_num_cached_tokens_monotonic(model_runner):
     prompt_ids = tokenizer.encode("Test")
     seq = Sequence(seq_id=4, prompt_token_ids=prompt_ids, block_size=16, num_layers=28)
 
-    logits = model_runner.run_prefill(seq)
+    logits = model_runner.run_prefill([seq])[0]
     seq.output_token_ids.append(logits.argmax(-1).item())
 
     prev_cached = seq.num_cached_tokens
     print(f"[CACHED] After prefill: {prev_cached}")
 
     for step in range(5):
-        logits = model_runner.run_decode(seq)
+        logits = model_runner.run_decode([seq])[0]
         seq.output_token_ids.append(logits.argmax(-1).item())
         now_cached = seq.num_cached_tokens
         diff = now_cached - prev_cached

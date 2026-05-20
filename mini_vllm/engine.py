@@ -6,7 +6,7 @@ from .model_runner import ModelRunner
 from .sequence import Sequence
 from .sampling_params import SamplingParams
 from .config import EngineConfig
-
+from .eagle_runner import EagleRunner
 
 def sample_token(logits: torch.Tensor, sampling_params: SamplingParams) -> int:
     """Sample a single token from logits.
@@ -39,6 +39,7 @@ class LLMEngine:
         )
         self.scheduler = Scheduler(config.max_num_seqs, config.max_num_batched_tokens,
                                   self.model_runner.block_manager)
+        self.spec_runner = EagleRunner(config, self.model_runner) if config.enable_eagle else None
 
     def _free_seq_resources(self, seq: Sequence) -> None:
         """Deallocate a sequence's blocks and clear its block_table."""
@@ -88,16 +89,27 @@ class LLMEngine:
                     continue
                 results.append(self._sample_and_append(seq, logits, sampling_params))
         else:
-            logits_list = self.model_runner.run_decode(seqs)
-            if logits_list is None:
-                victim = self.scheduler.preempt_one()
-                if victim is None:
-                    raise RuntimeError("OOM: no sequence to preempt")
-                self._free_seq_resources(victim)
-                print(f"[PREEMPT] seq_id={victim.seq_id}, released blocks")
-                return []
-            for seq, logits in zip(seqs, logits_list):
-                results.append(self._sample_and_append(seq, logits, sampling_params))
+            if (
+                self.spec_runner is not None
+                and self.spec_runner.draft_len > 0
+                and len(seqs) == 1  # spec_runner only supports batch_size=1 for now
+            ):
+                seq = seqs[0]
+                results.extend(self.spec_runner.step(seq, sampling_params))
+                if seq.is_finished():
+                    self.scheduler.postprocess(seq)
+                    self._free_seq_resources(seq)
+            else:
+                logits_list = self.model_runner.run_decode(seqs)
+                if logits_list is None:
+                    victim = self.scheduler.preempt_one()
+                    if victim is None:
+                        raise RuntimeError("OOM: no sequence to preempt")
+                    self._free_seq_resources(victim)
+                    print(f"[PREEMPT] seq_id={victim.seq_id}, released blocks")
+                    return []
+                for seq, logits in zip(seqs, logits_list):
+                    results.append(self._sample_and_append(seq, logits, sampling_params))
 
         return results
 
@@ -153,13 +165,17 @@ class LLM:
 
     def __init__(self, model_path: str, block_size: int = 16,
                  max_num_seqs: int = 8, max_num_batched_tokens: int = 2048,
-                 gpu_memory_utilization: float = 0.5):
+                 gpu_memory_utilization: float = 0.5,
+                 enable_eagle: bool = False,
+                 eagle_draft_len: int = 4):
         config = EngineConfig(
             model_path=model_path,
             block_size=block_size,
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
             gpu_memory_utilization=gpu_memory_utilization,
+            enable_eagle=enable_eagle,
+            eagle_draft_len=eagle_draft_len,
         )
         self.engine = LLMEngine(config)
 
