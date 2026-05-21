@@ -114,3 +114,31 @@ def test_chain_spec_matches_normal_greedy(model_runner: ModelRunner) -> None:
     spec_tokens = _run_spec_greedy(model_runner, prompt, max_tokens)
 
     assert spec_tokens == normal_tokens
+
+
+def test_chain_spec_full_accept_with_oracle_draft(model_runner: ModelRunner) -> None:
+    prompt = "The capital of France is"
+    max_tokens = 6
+    draft_len = 3
+    oracle_tokens = _run_normal_greedy(model_runner, prompt, max_tokens)
+
+    seq = _make_seq(model_runner, seq_id=300, prompt=prompt)
+    _prefill_first_token(model_runner, seq)
+    assert seq.output_token_ids == oracle_tokens[:1]
+
+    runner = EagleRunner(
+        EngineConfig(
+            model_path=MODEL_PATH,
+            enable_eagle=True,
+            eagle_mode="chain",
+            eagle_draft_len=draft_len,
+        ),
+        model_runner,
+    )
+    runner.draft_token_fn = lambda _seq: oracle_tokens[1:1 + draft_len]
+
+    results = runner.step(seq, SamplingParams(temperature=0.0, max_tokens=max_tokens))
+
+    assert len(results) == draft_len + 1
+    assert seq.output_token_ids == oracle_tokens[:seq.num_output_tokens]
+    assert seq.num_cached_tokens == seq.num_tokens - 1

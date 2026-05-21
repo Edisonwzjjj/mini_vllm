@@ -4,7 +4,7 @@ import pytest
 
 from mini_vllm.attention_patch import paged_ctx
 from mini_vllm.config import EngineConfig
-from mini_vllm.draft_tree import build_dummy_tree
+from mini_vllm.draft_tree import DraftTree, build_dummy_tree
 from mini_vllm.eagle_runner import EagleRunner
 from mini_vllm.model_runner import ModelRunner
 from mini_vllm.sampling_params import SamplingParams
@@ -144,3 +144,41 @@ def test_tree_spec_matches_normal_greedy(model_runner: ModelRunner) -> None:
     tree_tokens = _run_tree_greedy(model_runner, prompt, max_tokens)
 
     assert tree_tokens == normal_tokens
+
+
+def test_tree_spec_leftmost_full_accept_with_oracle_draft(model_runner: ModelRunner) -> None:
+    prompt = "The capital of France is"
+    max_tokens = 6
+    oracle_tokens = _run_normal_greedy(model_runner, prompt, max_tokens)
+
+    seq = _make_seq(model_runner, seq_id=300, prompt=prompt)
+    _prefill_first_token(model_runner, seq)
+    assert seq.output_token_ids == oracle_tokens[:1]
+
+    runner = EagleRunner(
+        EngineConfig(
+            model_path=MODEL_PATH,
+            enable_eagle=True,
+            eagle_mode="tree",
+            eagle_topk=2,
+            eagle_spec_steps=3,
+        ),
+        model_runner,
+    )
+
+    def oracle_tree(_seq: Sequence) -> DraftTree:
+        token_ids = [_seq.last_token_id] * 7
+        token_ids[0] = oracle_tokens[1]
+        token_ids[1] = oracle_tokens[2]
+        token_ids[2] = oracle_tokens[3]
+        return DraftTree(
+            token_ids=token_ids,
+            parent_indices=[-1, 0, 1, 1, 0, 4, 4],
+        )
+
+    runner.draft_tree_fn = oracle_tree
+    results = runner.step(seq, SamplingParams(temperature=0.0, max_tokens=max_tokens))
+
+    assert len(results) == 4
+    assert seq.output_token_ids == oracle_tokens[:seq.num_output_tokens]
+    assert seq.num_cached_tokens == seq.num_tokens - 1

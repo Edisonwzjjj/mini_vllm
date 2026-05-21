@@ -33,6 +33,7 @@ class EagleRunner:
         self.spec_steps = config.eagle_spec_steps
         self.model_runner = model_runner
         self.draft_token_fn: Callable[[Sequence], list[int]] | None = None
+        self.draft_tree_fn: Callable[[Sequence], DraftTree] | None = None
 
     def _draft_tokens(self, seq: Sequence) -> list[int]:
         if self.draft_token_fn is not None:
@@ -159,11 +160,7 @@ class EagleRunner:
             seq.mark_finished()
             return []
 
-        tree = build_dummy_tree(
-            root_token_id=seq.last_token_id,
-            topk=self.topk,
-            depth=self.spec_steps,
-        )
+        tree = self._draft_tree(seq)
         logits, old_num_cached, _ = self.model_runner.run_tree_verify(seq, tree)
         greedy_tokens = logits.argmax(dim=-1).tolist()
 
@@ -173,3 +170,8 @@ class EagleRunner:
         tokens_to_append = accepted_tokens + [greedy_tokens[pred_pos]]
 
         return self._append_tokens(seq, tokens_to_append, old_num_cached, sampling_params)
+
+    def _draft_tree(self, seq: Sequence) -> DraftTree:
+        if self.draft_tree_fn is not None:
+            return self.draft_tree_fn(seq)
+        return build_dummy_tree(root_token_id=seq.last_token_id, topk=self.topk, depth=self.spec_steps)
