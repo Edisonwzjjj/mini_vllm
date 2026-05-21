@@ -14,3 +14,6 @@ class EngineConfig:
     enable_eagle: bool = False
     eagle_draft_len: int = 4
     eagle_verify_greedy_only: bool = True
+    eagle_mode: str = "chain"
+    eagle_topk: int = 2
+    eagle_spec_steps: int = 3

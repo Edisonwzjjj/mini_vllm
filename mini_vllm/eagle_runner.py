@@ -6,6 +6,7 @@ from typing import Callable
 import torch
 
 from .config import EngineConfig
+from .draft_tree import DraftTree, build_dummy_tree
 from .model_runner import ModelRunner
 from .sampling_params import SamplingParams
 from .sequence import Sequence
@@ -27,6 +28,9 @@ class EagleRunner:
     def __init__(self, config: EngineConfig, model_runner: ModelRunner):
         self.draft_len = config.eagle_draft_len
         self.verify_greedy_only = config.eagle_verify_greedy_only
+        self.mode = config.eagle_mode
+        self.topk = config.eagle_topk
+        self.spec_steps = config.eagle_spec_steps
         self.model_runner = model_runner
         self.draft_token_fn: Callable[[Sequence], list[int]] | None = None
 
@@ -43,12 +47,55 @@ class EagleRunner:
                 self.model_runner.block_manager.deallocate(extra_blocks)
                 seq.block_table[layer] = seq.block_table[layer][:needed_blocks]
 
-    def step(self, seq: Sequence, sampling_params: SamplingParams) -> list[dict]:
+    def _append_tokens(
+        self,
+        seq: Sequence,
+        tokens_to_append: list[int],
+        old_num_cached: int,
+        sampling_params: SamplingParams,
+    ) -> list[dict]:
+        remaining_tokens = sampling_params.max_tokens - seq.num_output_tokens
+        tokens_to_append = tokens_to_append[:remaining_tokens]
+
+        results = []
+        appended = 0
+        for token_id in tokens_to_append:
+            seq.output_token_ids.append(token_id)
+            appended += 1
+            is_finished = (
+                token_id == self.model_runner.eos_token_id
+                or seq.num_output_tokens >= sampling_params.max_tokens
+            )
+            if is_finished:
+                seq.mark_finished()
+
+            results.append({
+                "seq_id": seq.seq_id,
+                "token_id": token_id,
+                "text": self.model_runner.tokenizer.decode([token_id], skip_special_tokens=True),
+                "finished": is_finished,
+            })
+            if is_finished:
+                break
+
+        new_cached = old_num_cached + appended
+        seq.num_cached_tokens = new_cached
+        self._trim_kv_blocks(seq, new_cached)
+        return results
+
+    def _check_greedy(self, sampling_params: SamplingParams) -> None:
         if self.verify_greedy_only:
             assert sampling_params.temperature < 1e-6, (
                 "EagleRunner only supports greedy decoding for verification"
             )
 
+    def step(self, seq: Sequence, sampling_params: SamplingParams) -> list[dict]:
+        self._check_greedy(sampling_params)
+        if self.mode == "tree":
+            return self._tree_step(seq, sampling_params)
+        return self._chain_step(seq, sampling_params)
+
+    def _chain_step(self, seq: Sequence, sampling_params: SamplingParams) -> list[dict]:
         remaining_tokens = sampling_params.max_tokens - seq.num_output_tokens
         if remaining_tokens <= 0:
             seq.mark_finished()
@@ -72,28 +119,57 @@ class EagleRunner:
         else:
             tokens_to_append = draft_tokens[:accepted] + [greedy_tokens[accepted]]
 
-        tokens_to_append = tokens_to_append[:remaining_tokens]
-        new_cached = old_num_cached + len(tokens_to_append)
-        seq.num_cached_tokens = new_cached
-        self._trim_kv_blocks(seq, new_cached)
+        return self._append_tokens(seq, tokens_to_append, old_num_cached, sampling_params)
 
-        results = []
-        for token_id in tokens_to_append:
-            seq.output_token_ids.append(token_id)
-            is_finished = (
-                token_id == self.model_runner.eos_token_id
-                or seq.num_output_tokens >= sampling_params.max_tokens
-            )
-            if is_finished:
-                seq.mark_finished()
+    def _is_tree_node_accepted(
+        self,
+        tree: DraftTree,
+        greedy_tokens: list[int],
+        node_idx: int,
+    ) -> bool:
+        parent_idx = tree.parent_indices[node_idx]
+        pred_pos = 0 if parent_idx == -1 else 1 + parent_idx
+        return greedy_tokens[pred_pos] == tree.token_ids[node_idx]
 
-            results.append({
-                "seq_id": seq.seq_id,
-                "token_id": token_id,
-                "text": self.model_runner.tokenizer.decode([token_id], skip_special_tokens=True),
-                "finished": is_finished,
-            })
-            if is_finished:
+    def _accepted_leftmost_path(
+        self,
+        tree: DraftTree,
+        greedy_tokens: list[int],
+    ) -> list[int]:
+        path: list[int] = []
+        parent_idx = -1
+        while True:
+            children = tree.children(parent_idx)
+            if not children:
                 break
 
-        return results
+            # First version only commits the leftmost child. This keeps the
+            # accepted path a contiguous DFS-prefix in the KV cache.
+            child_idx = children[0]
+            if not self._is_tree_node_accepted(tree, greedy_tokens, child_idx):
+                break
+
+            path.append(child_idx)
+            parent_idx = child_idx
+        return path
+
+    def _tree_step(self, seq: Sequence, sampling_params: SamplingParams) -> list[dict]:
+        remaining_tokens = sampling_params.max_tokens - seq.num_output_tokens
+        if remaining_tokens <= 0:
+            seq.mark_finished()
+            return []
+
+        tree = build_dummy_tree(
+            root_token_id=seq.last_token_id,
+            topk=self.topk,
+            depth=self.spec_steps,
+        )
+        logits, old_num_cached, _ = self.model_runner.run_tree_verify(seq, tree)
+        greedy_tokens = logits.argmax(dim=-1).tolist()
+
+        accepted_path = self._accepted_leftmost_path(tree, greedy_tokens)
+        accepted_tokens = [tree.token_ids[i] for i in accepted_path]
+        pred_pos = 0 if not accepted_path else 1 + accepted_path[-1]
+        tokens_to_append = accepted_tokens + [greedy_tokens[pred_pos]]
+
+        return self._append_tokens(seq, tokens_to_append, old_num_cached, sampling_params)

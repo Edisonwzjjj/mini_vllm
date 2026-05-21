@@ -167,7 +167,10 @@ class LLM:
                  max_num_seqs: int = 8, max_num_batched_tokens: int = 2048,
                  gpu_memory_utilization: float = 0.5,
                  enable_eagle: bool = False,
-                 eagle_draft_len: int = 4):
+                 eagle_draft_len: int = 4,
+                 eagle_mode: str = "chain",
+                 eagle_topk: int = 2,
+                 eagle_spec_steps: int = 3):
         config = EngineConfig(
             model_path=model_path,
             block_size=block_size,
@@ -176,6 +179,9 @@ class LLM:
             gpu_memory_utilization=gpu_memory_utilization,
             enable_eagle=enable_eagle,
             eagle_draft_len=eagle_draft_len,
+            eagle_mode=eagle_mode,
+            eagle_topk=eagle_topk,
+            eagle_spec_steps=eagle_spec_steps,
         )
         self.engine = LLMEngine(config)
 

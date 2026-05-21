@@ -26,6 +26,7 @@ class PageContext:
     attn_mask: torch.Tensor # (total_len, total_len) block-diagonal causal mask for prefill
     prefix_lengths: list[int]
     suffix_lengths: list[int]
+    tree_mask: torch.Tensor  # (num_draft, num_draft), used by tree verify
 
 
 paged_ctx = PageContext()
@@ -332,7 +333,50 @@ def _tree_verify_attention(
     value_states: torch.Tensor,
     meta: AttentionMeta,
 ) -> torch.Tensor:
-    raise NotImplementedError("tree verify attention is not implemented yet")
+    kv_cache = paged_ctx.kv_cache
+    block_size = kv_cache.shape[4]
+
+    assert meta["bsz"] == 1
+    assert len(paged_ctx.prefix_lengths) == 1
+    assert len(paged_ctx.suffix_lengths) == 1
+    assert len(paged_ctx.block_tables) == 1
+
+    prefix_len = paged_ctx.prefix_lengths[0]
+    suffix_len = paged_ctx.suffix_lengths[0]
+    total_len = prefix_len + suffix_len
+    tree_mask = paged_ctx.tree_mask.to(device=kv_cache.device, dtype=query_states.dtype)
+    assert suffix_len == 1 + tree_mask.size(0)
+
+    _write_prefill_kv(
+        kv_cache,
+        meta["layer_idx"],
+        paged_ctx.slot_mapping,
+        key_states,
+        value_states,
+        block_size,
+    )
+
+    K_full, V_full = _read_kv_from_blocks(
+        kv_cache,
+        meta["layer_idx"],
+        paged_ctx.block_tables[0],
+        total_len,
+        meta["num_kv_heads"],
+        meta["head_dim"],
+    )
+    K_i = K_full.unsqueeze(0)
+    V_i = V_full.unsqueeze(0)
+
+    K_expanded = repeat_kv(K_i, self.num_key_value_groups)
+    V_expanded = repeat_kv(V_i, self.num_key_value_groups)
+    mask = _build_tree_verify_mask(prefix_len, tree_mask, kv_cache.device)
+
+    return F.scaled_dot_product_attention(
+        query_states,
+        K_expanded,
+        V_expanded,
+        attn_mask=mask,
+    )
 
 
 def _output_projection(self: Any, attn_output: torch.Tensor, meta: AttentionMeta) -> torch.Tensor:
@@ -376,3 +420,34 @@ def apply_attention_patch(model: Any) -> None:
         attn = layer.self_attn
         attn.layer_idx = layer_idx
         attn.forward = paged_attention_forward.__get__(attn, type(attn))
+
+def _build_tree_verify_mask(
+    prefix_len: int,
+    tree_mask: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    assert tree_mask.dim() == 2
+    assert tree_mask.size(0) == tree_mask.size(1)
+
+    num_draft = tree_mask.size(0)
+    suffix_len = 1 + num_draft
+    total_len = prefix_len + suffix_len
+    mask = torch.full(
+        (1, 1, suffix_len, total_len),
+        float("-inf"),
+        device=device,
+        dtype=tree_mask.dtype,
+    )
+
+    # All suffix queries can attend to prefix tokens.
+    mask[:, :, :, :prefix_len] = 0.0
+
+    # Row 0 is the last accepted token. It can attend to prefix + itself.
+    mask[:, :, 0, prefix_len] = 0.0
+
+    # Draft rows can attend to the last accepted token.
+    mask[:, :, 1:, prefix_len] = 0.0
+
+    # Draft rows attend to draft ancestors/self according to tree_mask.
+    mask[:, :, 1:, prefix_len + 1:] = tree_mask.to(device=device)
+    return mask

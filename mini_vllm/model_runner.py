@@ -6,7 +6,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from mini_vllm.attention_patch import apply_attention_patch, paged_ctx
 from mini_vllm.sequence import Sequence
 from mini_vllm.block_manager import BlockManager
-
+from mini_vllm.draft_tree import DraftTree
 class ModelRunner:
     def __init__(self, model_path: str, block_size: int, max_num_seqs: int,
                  max_num_batched_tokens: int, gpu_memory_utilization: float):
@@ -239,6 +239,56 @@ class ModelRunner:
             logits_list.append(outputs.logits[i, -1, :])  # (vocab_size,)
 
         return logits_list
+
+
+    def run_tree_verify(self, seq: Sequence, draft_tree: DraftTree) -> tuple[torch.Tensor, int, int]:
+        """Run target-model verification for tree speculative decoding.
+
+        The input suffix is [last_token] + draft tree tokens. This writes KV for
+        the suffix with tree attention and leaves commit or rollback of
+        seq.num_cached_tokens to EagleRunner.
+        """
+        verify_token_ids = [seq.last_token_id] + draft_tree.token_ids
+        old_num_cached = seq.num_cached_tokens
+        target_num_cached = old_num_cached + len(verify_token_ids)
+
+        num_blocks_needed = self.block_manager.num_blocks_needed(target_num_cached)
+        cur_blocks = len(seq.block_table[0])
+        if cur_blocks < num_blocks_needed:
+            new_blocks = self.block_manager.try_allocate(num_blocks_needed - cur_blocks)
+            if new_blocks is None:
+                raise RuntimeError("OOM during tree speculative verification")
+            for layer in range(self.num_layers):
+                seq.block_table[layer].extend(new_blocks)
+
+        full_slot_mapping = self.block_manager.get_slot_mapping(
+            seq.block_table[0], target_num_cached
+        )
+        suffix_slot_mapping = full_slot_mapping[old_num_cached:target_num_cached]
+
+        input_ids = torch.tensor([verify_token_ids], device=self.device)
+        position_ids = torch.tensor(
+            [list(range(old_num_cached, target_num_cached))], device=self.device
+        )
+
+        paged_ctx.kv_cache = self.kv_cache
+        paged_ctx.slot_mapping = suffix_slot_mapping
+        paged_ctx.is_prefill = True
+        paged_ctx.is_tree_verify = True
+        paged_ctx.attn_mask = None
+        paged_ctx.prefix_lengths = [old_num_cached]
+        paged_ctx.suffix_lengths = [len(verify_token_ids)]
+        paged_ctx.block_tables = [seq.block_table[0]]
+        paged_ctx.tree_mask = draft_tree.build_tree_mask(torch.device(self.device))
+
+        try:
+            with torch.no_grad():
+                outputs = self.model(input_ids=input_ids, position_ids=position_ids)
+        finally:
+            paged_ctx.is_tree_verify = False
+
+        return outputs.logits[0], old_num_cached, target_num_cached
+
 
     def run_chain_verify(self, seq: Sequence, draft_token_ids: list[int]) -> tuple[torch.Tensor, int, int]:
         """Run target-model verification for chain speculative decoding.
