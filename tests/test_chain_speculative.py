@@ -142,3 +142,81 @@ def test_chain_spec_full_accept_with_oracle_draft(model_runner: ModelRunner) -> 
     assert len(results) == draft_len + 1
     assert seq.output_token_ids == oracle_tokens[:seq.num_output_tokens]
     assert seq.num_cached_tokens == seq.num_tokens - 1
+
+
+def _run_pld_spec(
+    model_runner: ModelRunner,
+    prompt: str,
+    max_tokens: int,
+    draft_len: int = 4,
+    max_ngram: int = 3,
+    min_ngram: int = 2,
+) -> tuple[list[int], dict]:
+    seq = _make_seq(model_runner, seq_id=400, prompt=prompt)
+    _prefill_first_token(model_runner, seq)
+
+    runner = EagleRunner(
+        EngineConfig(
+            model_path=MODEL_PATH,
+            enable_eagle=True,
+            eagle_mode="chain",
+            eagle_draft_len=draft_len,
+            eagle_use_pld=True,
+            eagle_pld_max_ngram=max_ngram,
+            eagle_pld_min_ngram=min_ngram,
+        ),
+        model_runner,
+    )
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+    while not seq.is_finished() and seq.num_output_tokens < max_tokens:
+        before = seq.num_output_tokens
+        runner.step(seq, sampling_params)
+        assert seq.num_cached_tokens == seq.num_tokens - 1
+        assert seq.num_output_tokens > before
+    return seq.output_token_ids, dict(runner.metrics)
+
+
+def test_chain_spec_pld_fallback_on_short_prompt(model_runner: ModelRunner) -> None:
+    """PLD 在短 prompt 下必 miss，验证 fallback decode 路径正确且 metrics 被填充。"""
+    prompt = "Hi"
+    max_tokens = 6
+
+    normal_tokens = _run_normal_greedy(model_runner, prompt, max_tokens)
+    spec_tokens, metrics = _run_pld_spec(model_runner, prompt, max_tokens)
+
+    assert spec_tokens == normal_tokens
+    assert metrics["fallback_steps"] >= 1
+
+
+def test_chain_spec_pld_partial_accept_with_injected_draft(model_runner: ModelRunner) -> None:
+    prompt = "The capital of France is"
+    max_tokens = 5
+    oracle = _run_normal_greedy(model_runner, prompt, max_tokens)
+
+    seq = _make_seq(model_runner, seq_id=500, prompt=prompt)
+    _prefill_first_token(model_runner, seq)
+
+    def hybrid_draft(_seq):
+        # 前 2 个对，后 2 个故意错（用 prompt 第一个 token，模型该位置不会 greedy 出来）
+        return [oracle[1], oracle[2], oracle[0], oracle[0]]
+
+    runner = EagleRunner(
+        EngineConfig(
+            model_path=MODEL_PATH,
+            enable_eagle=True,
+            eagle_mode="chain",
+            eagle_draft_len=4,
+        ),
+        model_runner,
+    )
+    runner.reset_metrics()
+    runner.draft_token_fn = hybrid_draft
+
+    results = runner.step(seq, SamplingParams(temperature=0.0, max_tokens=max_tokens))
+
+    assert len(results) == 3  # 2 accepted + 1 correction
+    assert seq.output_token_ids[:4] == oracle[:4]
+    assert seq.num_cached_tokens == seq.num_tokens - 1
+    assert runner.metrics["draft_tokens_proposed"] == 4
+    assert runner.metrics["draft_tokens_accepted"] == 2
+    assert runner.metrics["bonus_tokens"] == 0  # 不是 full accept
