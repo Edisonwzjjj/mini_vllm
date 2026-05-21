@@ -17,3 +17,6 @@ class EngineConfig:
     eagle_mode: str = "chain"
     eagle_topk: int = 2
     eagle_spec_steps: int = 3
+    eagle_use_pld: bool = False
+    eagle_pld_max_ngram: int = 3
+    eagle_pld_min_ngram: int = 2

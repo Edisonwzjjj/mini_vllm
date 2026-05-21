@@ -170,7 +170,10 @@ class LLM:
                  eagle_draft_len: int = 4,
                  eagle_mode: str = "chain",
                  eagle_topk: int = 2,
-                 eagle_spec_steps: int = 3):
+                 eagle_spec_steps: int = 3,
+                 eagle_use_pld: bool = False,
+                 eagle_pld_max_ngram: int = 3,
+                 eagle_pld_min_ngram: int = 2):
         config = EngineConfig(
             model_path=model_path,
             block_size=block_size,
@@ -182,6 +185,9 @@ class LLM:
             eagle_mode=eagle_mode,
             eagle_topk=eagle_topk,
             eagle_spec_steps=eagle_spec_steps,
+            eagle_use_pld=eagle_use_pld,
+            eagle_pld_max_ngram=eagle_pld_max_ngram,
+            eagle_pld_min_ngram=eagle_pld_min_ngram,
         )
         self.engine = LLMEngine(config)
 
