@@ -182,3 +182,102 @@ def test_tree_spec_leftmost_full_accept_with_oracle_draft(model_runner: ModelRun
     assert len(results) == 4
     assert seq.output_token_ids == oracle_tokens[:seq.num_output_tokens]
     assert seq.num_cached_tokens == seq.num_tokens - 1
+
+
+# ---------------------------------------------------------------------------
+# Tree spec + PLD multi-branch draft (P0.2)
+# ---------------------------------------------------------------------------
+
+
+def _run_pld_tree_spec(
+    model_runner: ModelRunner,
+    prompt: str,
+    max_tokens: int,
+    topk: int = 2,
+    depth: int = 3,
+    max_ngram: int = 3,
+    min_ngram: int = 2,
+) -> tuple[list[int], dict]:
+    """End-to-end tree-spec runner with PLD multi-branch draft.
+
+    Asserts the chain-spec invariants on every step:
+      - num_cached_tokens == num_tokens - 1  (KV invariant)
+      - at least 1 token of forward progress per step
+    Returns (output_token_ids, metrics_snapshot).
+    """
+    seq = _make_seq(model_runner, seq_id=700, prompt=prompt)
+    _prefill_first_token(model_runner, seq)
+
+    runner = EagleRunner(
+        EngineConfig(
+            model_path=MODEL_PATH,
+            enable_eagle=True,
+            eagle_mode="tree",
+            eagle_topk=topk,
+            eagle_spec_steps=depth,
+            eagle_use_pld=True,
+            eagle_pld_max_ngram=max_ngram,
+            eagle_pld_min_ngram=min_ngram,
+        ),
+        model_runner,
+    )
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+
+    while not seq.is_finished() and seq.num_output_tokens < max_tokens:
+        before = seq.num_output_tokens
+        runner.step(seq, sampling_params)
+        assert seq.num_cached_tokens == seq.num_tokens - 1
+        assert seq.num_output_tokens > before  # forward-progress invariant
+
+    return seq.output_token_ids, dict(runner.metrics)
+
+
+def test_tree_spec_pld_matches_normal_greedy(model_runner: ModelRunner) -> None:
+    """正确性：tree spec + PLD draft 的输出必须等于纯 greedy decode 的输出。
+
+    考点：
+    - leftmost commit + PLD draft 的接受逻辑不会改变 greedy 输出
+    - PLD 找不到匹配时降级为 padding tree，verify forward 仍维持正确性
+    """
+    prompt = "List the days: Monday, Tuesday, Wednesday. List the days: Monday,"
+    max_tokens = 10
+
+    normal_tokens = _run_normal_greedy(model_runner, prompt, max_tokens)
+    spec_tokens, metrics = _run_pld_tree_spec(model_runner, prompt, max_tokens)
+
+    assert spec_tokens == normal_tokens, (
+        f"tree-spec output diverged from greedy:\n"
+        f"  normal = {normal_tokens}\n"
+        f"  spec   = {spec_tokens}"
+    )
+    assert metrics["spec_steps"] >= 1, (
+        f"expected at least 1 spec step (prompt has strong repetition), "
+        f"got metrics={metrics}"
+    )
+
+
+def test_tree_spec_pld_degrades_on_short_prompt(model_runner: ModelRunner) -> None:
+    """降级行为：短 prompt 下 PLD 几乎全 miss，但 tree spec 仍维持 greedy 等价性。
+
+    考点：
+    - 短 prompt 上 PLD ngram 查询大量失败 → 返回的 7 槽树几乎全是 last_token padding
+    - verify forward 在 padding tree 上仍能正确跑（acceptance 很低但 KV 不变量保住）
+    - 注：tree-mode 的 _fallback_decode_step 仅在 prompt_lookup_tree 返回 None
+      时触发（仅空 token_ids 才会），生产路径几乎不会走 —— 那条路由由
+      test_draft_pld_tree_empty 单元测试覆盖。
+    """
+    prompt = "Hi"
+    max_tokens = 6
+
+    normal_tokens = _run_normal_greedy(model_runner, prompt, max_tokens)
+    spec_tokens, metrics = _run_pld_tree_spec(model_runner, prompt, max_tokens)
+
+    assert spec_tokens == normal_tokens, (
+        f"short-prompt tree-spec output diverged from greedy:\n"
+        f"  normal = {normal_tokens}\n"
+        f"  spec   = {spec_tokens}"
+    )
+    assert metrics["spec_steps"] >= 1, (
+        f"tree spec should still run (with padding tree), got metrics={metrics}"
+    )
+

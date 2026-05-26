@@ -10,7 +10,7 @@ from .draft_tree import DraftTree, build_dummy_tree
 from .model_runner import ModelRunner
 from .sampling_params import SamplingParams
 from .sequence import Sequence
-from .draft_pld import prompt_lookup_draft
+from .draft_pld import prompt_lookup_draft, prompt_lookup_tree
 
 @dataclass
 class VerifyResult:
@@ -232,6 +232,11 @@ class EagleRunner:
             return []
 
         tree = self._draft_tree(seq)
+        if tree is None:
+            # No draft (e.g. PLD found no n-gram match) — fall back to a
+            # normal decode step so we still make at least 1 token of progress.
+            return self._fallback_decode_step(seq, sampling_params)
+
         logits, old_num_cached, _ = self.model_runner.run_tree_verify(seq, tree)
         greedy_tokens = logits.argmax(dim=-1).tolist()
 
@@ -262,7 +267,21 @@ class EagleRunner:
             parent_idx = children[0]
         return length
 
-    def _draft_tree(self, seq: Sequence) -> DraftTree:
+    def _draft_tree(self, seq: Sequence) -> DraftTree | None:
+        """Build a DraftTree for tree spec verify.
+
+        Returns None when no draft can be produced (caller falls back to a
+        normal decode step). The dummy fallback never returns None — it always
+        produces a 7-slot tree filled with last_token_id.
+        """
         if self.draft_tree_fn is not None:
             return self.draft_tree_fn(seq)
+        if self.use_pld_default:
+            return prompt_lookup_tree(
+                token_ids=seq.token_ids,
+                topk=self.topk,
+                depth=self.spec_steps,
+                max_ngram=self.pld_max_ngram,
+                min_ngram=self.pld_min_ngram,
+            )
         return build_dummy_tree(root_token_id=seq.last_token_id, topk=self.topk, depth=self.spec_steps)
