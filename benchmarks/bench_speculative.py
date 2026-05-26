@@ -1,16 +1,19 @@
-"""Benchmark: greedy vs chain-PLD vs tree-dummy speculative decode.
+"""Benchmark: greedy vs chain-PLD vs tree-dummy vs tree-PLD speculative decode.
 
-Three runs on the same prompts:
+Four runs on the same prompts:
   1. greedy baseline (no spec)
   2. chain spec + PLD draft (real 0-cost draft from prompt n-grams)
   3. tree spec + dummy draft (depth-3 leftmost = repeat(last_token))
+  4. tree spec + PLD multi-branch draft (option-A 7-slot topology)
 
 Variable separation:
-  - chain vs greedy  -> chain spec end-to-end value (with a real draft)
-  - tree-dummy vs greedy -> isolates verify forward overhead when draft
+  - chain vs greedy           -> chain spec end-to-end value (with real draft)
+  - tree-dummy vs greedy      -> isolates verify-forward overhead when draft
     quality is ~0 (dummy chain is repeat-token, almost always rejected).
     A speedup < 1.0x quantifies the verify-forward tax.
-  - chain - tree gap -> draft-quality contribution (PLD vs dummy)
+  - tree-PLD vs tree-dummy    -> draft-quality contribution within tree mode
+  - tree-PLD vs chain-PLD     -> tree-topology value (does fanning out help?)
+  - chain - tree-dummy gap    -> chain draft-quality contribution
 
 Correctness sanity (temperature=0, greedy):
   output token ids must equal the greedy baseline for every prompt.
@@ -120,7 +123,7 @@ def main():
 
     print()
     print("=" * 72)
-    print(f"[3/3] tree spec + dummy draft (topk={TREE_TOPK}, depth={TREE_DEPTH})")
+    print(f"[3/4] tree spec + dummy draft (topk={TREE_TOPK}, depth={TREE_DEPTH})")
     print("=" * 72)
     llm_t = make_llm(
         enable_eagle=True,
@@ -139,19 +142,46 @@ def main():
 
     print()
     print("=" * 72)
+    print(f"[4/4] tree spec + PLD multi-branch (topk={TREE_TOPK}, depth={TREE_DEPTH})")
+    print("=" * 72)
+    llm_tp = make_llm(
+        enable_eagle=True,
+        eagle_mode="tree",
+        eagle_topk=TREE_TOPK,
+        eagle_spec_steps=TREE_DEPTH,
+        eagle_use_pld=True,
+        eagle_pld_max_ngram=3,
+        eagle_pld_min_ngram=2,
+    )
+    runner_tp = llm_tp.engine.spec_runner
+    runner_tp.reset_metrics()
+    tp_out, tp_tok, tp_t = run(llm_tp, PROMPTS, sp)
+    tp_tps = tp_tok / tp_t
+    print(f"tokens={tp_tok}  time={tp_t:.2f}s  tps={tp_tps:.2f}")
+    print(fmt_metrics(runner_tp.metrics, TREE_DEPTH))
+    tree_pld_metrics = dict(runner_tp.metrics)
+    del llm_tp
+
+    print()
+    print("=" * 72)
     print("Summary")
     print("=" * 72)
     print(f"{'method':<32}{'tokens/s':>12}{'speedup':>10}")
     print(f"{'greedy baseline':<32}{g_tps:>12.2f}{'1.00x':>10}")
     print(f"{'chain spec (PLD draft)':<32}{c_tps:>12.2f}{f'{c_tps/g_tps:.2f}x':>10}")
     print(f"{'tree spec (dummy draft)':<32}{t_tps:>12.2f}{f'{t_tps/g_tps:.2f}x':>10}")
+    print(f"{'tree spec (PLD draft)':<32}{tp_tps:>12.2f}{f'{tp_tps/g_tps:.2f}x':>10}")
 
     print()
     print("Variable separation:")
-    print(f"  verify-forward tax (tree-dummy / greedy) = {t_tps/g_tps:.2f}x  "
+    print(f"  verify-forward tax (tree-dummy / greedy)        = {t_tps/g_tps:.2f}x  "
           "(< 1.0 means verify forward is slower than single-token decode)")
-    print(f"  draft-quality contribution (chain - tree) = {c_tps/g_tps - t_tps/g_tps:+.2f}  "
-          "(speedup gained by replacing dummy with PLD)")
+    print(f"  tree draft-quality (tree-PLD - tree-dummy)      = {tp_tps/g_tps - t_tps/g_tps:+.2f}  "
+          "(speedup gained by replacing dummy with PLD inside tree mode)")
+    print(f"  tree-topology value (tree-PLD - chain-PLD)      = {tp_tps/g_tps - c_tps/g_tps:+.2f}  "
+          "(does fanning out branches beat a single chain?)")
+    print(f"  chain draft-quality (chain-PLD - tree-dummy)    = {c_tps/g_tps - t_tps/g_tps:+.2f}  "
+          "(chain with real PLD vs no-draft-quality tree baseline)")
 
     print()
     # Correctness sanity vs greedy
@@ -174,8 +204,9 @@ def main():
             print(f"  {label}: FAIL ({bad} mismatches)")
 
     print("Correctness vs greedy:")
-    cmp("chain spec ", g_out, c_out)
-    cmp("tree spec  ", g_out, t_out)
+    cmp("chain spec    ", g_out, c_out)
+    cmp("tree spec     ", g_out, t_out)
+    cmp("tree spec PLD ", g_out, tp_out)
 
     print()
     print("Per-prompt PLD acceptance (chain spec, isolated runs):")
