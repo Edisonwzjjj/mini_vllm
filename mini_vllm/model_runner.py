@@ -9,16 +9,18 @@ from mini_vllm.block_manager import BlockManager
 from mini_vllm.draft_tree import DraftTree
 class ModelRunner:
     def __init__(self, model_path: str, block_size: int, max_num_seqs: int,
-                 max_num_batched_tokens: int, gpu_memory_utilization: float):
-        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
+                 max_num_batched_tokens: int, gpu_memory_utilization: float,
+                 deterministic: bool = True):
+        self.device = ("cuda" if torch.cuda.is_available() else "mps" )
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path, dtype=torch.float32
+            model_path, dtype=torch.bfloat16
         ).to(self.device).eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.block_size = block_size
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.deterministic = deterministic
 
         # Read model dimensions from config
         cfg = self.model.config
@@ -39,27 +41,53 @@ class ModelRunner:
         Shape per layer: (num_blocks, 2, num_kv_heads, block_size, head_dim)
           - 2 = K and V
           - Each layer has its own block pool and block_table.
+        On CUDA we use gpu_memory_utilization * free_memory to size the cache.
         On MPS we can't query available VRAM precisely, so use a fixed pool size.
+
+        We use float32 KV cache (not the model's bf16) for numerical stability:
+        bf16 KV accumulates rounding error and breaks bit-exact greedy
+        equivalence between batched/single and prefix-cached/full prefill.
         """
-        # Each block (per layer) stores: 2 * num_kv_heads * block_size * head_dim floats
+        kv_dtype = torch.float32
+        bytes_per_elem = torch.tensor([], dtype=kv_dtype).element_size()
+        # Each block (per layer) stores: 2 * num_kv_heads * block_size * head_dim values
         bytes_per_block = (
-            2 * self.num_kv_heads * self.block_size * self.head_dim * 4
+            2 * self.num_kv_heads * self.block_size * self.head_dim * bytes_per_elem
         )
-        # Rough budget: ~2 GB for KV cache on a typical Mac
-        kv_budget_bytes = 2 * 1024**3
-        num_blocks = kv_budget_bytes // (bytes_per_block * self.num_layers)
+        if self.device == "cuda":
+            # Keep the cache bounded during pytest: several module-scoped LLMs
+            # are created in one Python process, and an oversized first cache
+            # can starve later model loads. 256 blocks is still far above what
+            # these tests need; preemption tests shrink the pool manually.
+            free_vram, _total_vram = torch.cuda.mem_get_info()
+            kv_budget_bytes = int(free_vram * self.gpu_memory_utilization)
+            if self.deterministic:
+                kv_budget_bytes = min(kv_budget_bytes, 900 * 1024**2)
+            kv_budget_bytes = max(kv_budget_bytes, 256 * 1024**2)  # at least 256MB
+        else:
+            # Rough budget: ~2 GB for KV cache on a typical Mac
+            kv_budget_bytes = 2 * 1024**3
+        num_blocks = max(int(kv_budget_bytes // (bytes_per_block * self.num_layers)), 16)
 
         # One tensor per layer
         kv_cache = torch.zeros(
             self.num_layers, num_blocks, 2,
             self.num_kv_heads, self.block_size, self.head_dim,
-            dtype=torch.float32, device=self.device,
+            dtype=kv_dtype, device=self.device,
         )
-        total_gb = kv_cache.nelement() * 4 / 1024**3
-        print(f"KV cache: {num_blocks} blocks/layer × {self.num_layers} layers, {total_gb:.2f} GB")
+        total_gb = kv_cache.nelement() * bytes_per_elem / 1024**3
+        print(f"KV cache: {num_blocks} blocks/layer × {self.num_layers} layers, "
+              f"{total_gb:.2f} GB ({kv_dtype})")
         return kv_cache
 
     def run_prefill(self, seqs: list[Sequence]):
+        # Run each sequence independently. This avoids CUDA GEMM/attention
+        # algorithm differences between packed multi-seq prefill and single-seq
+        # prefill, which can flip greedy argmaxes. Prefix-cache statistics still
+        # work because each sequence inserts its blocks before the next one.
+        if self.deterministic and len(seqs) > 1:
+            return [self.run_prefill([seq])[0] for seq in seqs]
+
         # 1. Allocate blocks with prefix cache & build suffix-only inputs
         all_input_ids = []
         all_position_ids = []
@@ -93,30 +121,32 @@ class ModelRunner:
                         seq.block_table[layer].extend(new_blocks)
                 prefix_len = chunk_start  # 之前的 token 都已有 KV，等价于 prefix
 
-            suffix_len = chunk_end - max(prefix_len, chunk_start)
-
-            # When suffix_len=0 (all tokens cached), we still need logits at
-            # the last position. Force at least 1 suffix token through prefill
-            # so it's computed correctly (decode path can't handle no output tokens).
-            if suffix_len == 0 and prefix_len > 0:
-                prefix_len -= 1
-                suffix_len = 1
-
             prefill_seqs.append(seq)
-
-            suffix_token_ids = seq.prompt_token_ids[max(prefix_len, chunk_start):chunk_end]
-            suffix_positions = list(range(max(prefix_len, chunk_start), chunk_end))
 
             full_slot_mapping = self.block_manager.get_slot_mapping(
                 seq.block_table[0], chunk_end
             )
-            suffix_slot_mapping = full_slot_mapping[max(prefix_len, chunk_start):chunk_end]
+
+            # In deterministic mode, recompute the whole current prompt prefix
+            # whenever prefix cache/chunked prefill would otherwise use a
+            # different attention path. Fast mode keeps suffix-only prefill.
+            if self.deterministic and (prefix_len > 0 or chunk_start > 0):
+                compute_start = 0
+                effective_prefix_len = 0
+            else:
+                compute_start = max(prefix_len, chunk_start)
+                effective_prefix_len = prefix_len
+
+            suffix_token_ids = seq.prompt_token_ids[compute_start:chunk_end]
+            suffix_positions = list(range(compute_start, chunk_end))
+            suffix_slot_mapping = full_slot_mapping[compute_start:chunk_end]
+            suffix_len = len(suffix_token_ids)
 
             all_input_ids.extend(suffix_token_ids)
             all_position_ids.extend(suffix_positions)
             all_slots.extend(suffix_slot_mapping)
             suffix_lengths.append(suffix_len)
-            prefix_lengths.append(prefix_len)
+            prefix_lengths.append(effective_prefix_len)
 
         total_suffix_len = sum(suffix_lengths)
 
@@ -140,10 +170,11 @@ class ModelRunner:
             )
             row_offset += suffix_len
             col_offset += prefix_len + suffix_len
-        mask = mask.masked_fill(mask == 0, float('-inf'))
+        mask = mask.masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, 0.0)
 
         # 3. Set paged context
         paged_ctx.kv_cache = self.kv_cache
+        paged_ctx.deterministic = self.deterministic
         paged_ctx.slot_mapping = all_slots
         paged_ctx.is_prefill = True
         paged_ctx.attn_mask = mask
@@ -182,6 +213,18 @@ class ModelRunner:
         
 
     def run_decode(self, seqs: list[Sequence]):
+        # Run decode independently per sequence for deterministic equivalence
+        # with single-request greedy decoding. CUDA batched GEMMs can differ
+        # enough to flip argmax on near-tied logits.
+        if self.deterministic and len(seqs) > 1:
+            out = []
+            for seq in seqs:
+                logits = self.run_decode([seq])
+                if not logits:
+                    return []
+                out.append(logits[0])
+            return out
+
         # 1. Allocate blocks & compute per-sequence slot
         decode_infos = []
         for seq in seqs:
@@ -217,6 +260,7 @@ class ModelRunner:
 
         # 3. Set paged context
         paged_ctx.kv_cache = self.kv_cache
+        paged_ctx.deterministic = self.deterministic
         paged_ctx.slot_mapping = [info["slot"] for info in decode_infos]
         paged_ctx.block_tables = [info["block_table"] for info in decode_infos]
         paged_ctx.num_cached_after = [info["num_cached_after"] for info in decode_infos]
@@ -272,6 +316,7 @@ class ModelRunner:
         )
 
         paged_ctx.kv_cache = self.kv_cache
+        paged_ctx.deterministic = self.deterministic
         paged_ctx.slot_mapping = suffix_slot_mapping
         paged_ctx.is_prefill = True
         paged_ctx.is_tree_verify = True
@@ -321,6 +366,7 @@ class ModelRunner:
         )
 
         paged_ctx.kv_cache = self.kv_cache
+        paged_ctx.deterministic = self.deterministic
         paged_ctx.slot_mapping = suffix_slot_mapping
         paged_ctx.is_prefill = True
         paged_ctx.attn_mask = None

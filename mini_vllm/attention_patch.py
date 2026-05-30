@@ -135,13 +135,60 @@ def _read_kv_from_blocks(
     return K_full, V_full
 
 
-def _build_suffix_prefill_mask(prefix_len: int, suffix_len: int, device: torch.device) -> torch.Tensor:
+def _sdpa(
+    query_states: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    is_causal: bool = False,
+) -> torch.Tensor:
+    """Deterministic fp32 attention used by all paged-attention paths.
+
+    CUDA's fused SDPA kernels can pick different algorithms for full prefill,
+    suffix prefill, batched decode, and single decode. Small numeric differences
+    are enough to flip greedy argmaxes in these tests. Use the same explicit
+    fp32 matmul/softmax path everywhere so chunked/full, batched/single, and
+    speculative/normal decoding are numerically aligned.
+    """
+    if not getattr(paged_ctx, "deterministic", True):
+        q_dtype = query_states.dtype
+        if K.dtype != q_dtype:
+            K = K.to(q_dtype)
+        if V.dtype != q_dtype:
+            V = V.to(q_dtype)
+        if attn_mask is not None and attn_mask.dtype != q_dtype:
+            attn_mask = attn_mask.to(q_dtype)
+        return F.scaled_dot_product_attention(
+            query_states, K, V, attn_mask=attn_mask, is_causal=is_causal
+        )
+
+    q_dtype = query_states.dtype
+    Q = query_states.to(torch.float32)
+    K = K.to(torch.float32)
+    V = V.to(torch.float32)
+
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / (Q.shape[-1] ** 0.5)
+    if is_causal:
+        q_len, k_len = scores.shape[-2], scores.shape[-1]
+        causal = torch.ones(q_len, k_len, device=scores.device, dtype=torch.bool).tril(
+            diagonal=k_len - q_len
+        )
+        scores = scores.masked_fill(~causal, float("-inf"))
+    if attn_mask is not None:
+        scores = scores + attn_mask.to(device=scores.device, dtype=scores.dtype)
+
+    probs = torch.softmax(scores, dim=-1)
+    out = torch.matmul(probs, V)
+    return out.to(q_dtype)
+
+
+def _build_suffix_prefill_mask(prefix_len: int, suffix_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     total_len = prefix_len + suffix_len
-    mask = torch.full((1, 1, suffix_len, total_len), float("-inf"), device=device)
+    mask = torch.full((1, 1, suffix_len, total_len), float("-inf"), device=device, dtype=dtype)
     mask[0, 0, :, :prefix_len] = 0.0
 
     causal = torch.tril(torch.ones(suffix_len, suffix_len, device=device)).bool()
-    suffix_mask = torch.full((suffix_len, suffix_len), float("-inf"), device=device)
+    suffix_mask = torch.full((suffix_len, suffix_len), float("-inf"), device=device, dtype=dtype)
     suffix_mask[causal] = 0.0
     mask[0, 0, :, prefix_len:] = suffix_mask
     return mask
@@ -152,8 +199,9 @@ def _build_decode_mask(
     max_cached: int,
     num_cached_list: list[int],
     device: torch.device,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    mask = torch.zeros(bsz, 1, 1, max_cached, device=device)
+    mask = torch.zeros(bsz, 1, 1, max_cached, device=device, dtype=dtype)
     for i in range(bsz):
         mask[i, 0, 0, num_cached_list[i]:] = float("-inf")
     return mask
@@ -185,14 +233,14 @@ def _prefill_attention(
         mask = paged_ctx.attn_mask.unsqueeze(0).unsqueeze(0).expand(
             -1, meta["num_heads"], -1, -1
         )
-        return F.scaled_dot_product_attention(
+        return _sdpa(
             query_states,
             K_expanded,
             V_expanded,
             attn_mask=mask,
         )
 
-    return F.scaled_dot_product_attention(
+    return _sdpa(
         query_states,
         K_expanded,
         V_expanded,
@@ -241,9 +289,9 @@ def _suffix_prefill_attention(
 
         K_expanded = repeat_kv(K_i, self.num_key_value_groups)
         V_expanded = repeat_kv(V_i, self.num_key_value_groups)
-        mask = _build_suffix_prefill_mask(prefix_len, suffix_len, kv_cache.device)
+        mask = _build_suffix_prefill_mask(prefix_len, suffix_len, kv_cache.device, K_expanded.dtype)
         attn_outputs.append(
-            F.scaled_dot_product_attention(
+            _sdpa(
                 Q_i,
                 K_expanded,
                 V_expanded,
@@ -316,9 +364,9 @@ def _decode_attention(
     )
     K_expanded = repeat_kv(K_batch, self.num_key_value_groups)
     V_expanded = repeat_kv(V_batch, self.num_key_value_groups)
-    mask = _build_decode_mask(meta["bsz"], max_cached, num_cached_list, kv_cache.device)
+    mask = _build_decode_mask(meta["bsz"], max_cached, num_cached_list, kv_cache.device, K_expanded.dtype)
 
-    return F.scaled_dot_product_attention(
+    return _sdpa(
         query_states,
         K_expanded,
         V_expanded,
@@ -371,7 +419,7 @@ def _tree_verify_attention(
     V_expanded = repeat_kv(V_i, self.num_key_value_groups)
     mask = _build_tree_verify_mask(prefix_len, tree_mask, kv_cache.device)
 
-    return F.scaled_dot_product_attention(
+    return _sdpa(
         query_states,
         K_expanded,
         V_expanded,

@@ -36,6 +36,7 @@ class LLMEngine:
             max_num_seqs=config.max_num_seqs,
             max_num_batched_tokens=config.max_num_batched_tokens,
             gpu_memory_utilization=config.gpu_memory_utilization,
+            deterministic=config.deterministic,
         )
         self.scheduler = Scheduler(config.max_num_seqs, config.max_num_batched_tokens,
                                   self.model_runner.block_manager)
@@ -173,7 +174,8 @@ class LLM:
                  eagle_spec_steps: int = 3,
                  eagle_use_pld: bool = False,
                  eagle_pld_max_ngram: int = 3,
-                 eagle_pld_min_ngram: int = 2):
+                 eagle_pld_min_ngram: int = 2,
+                 deterministic: bool = True):
         config = EngineConfig(
             model_path=model_path,
             block_size=block_size,
@@ -188,6 +190,7 @@ class LLM:
             eagle_use_pld=eagle_use_pld,
             eagle_pld_max_ngram=eagle_pld_max_ngram,
             eagle_pld_min_ngram=eagle_pld_min_ngram,
+            deterministic=deterministic,
         )
         self.engine = LLMEngine(config)
 

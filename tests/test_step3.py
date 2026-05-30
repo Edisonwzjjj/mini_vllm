@@ -21,9 +21,10 @@ def model_runner():
 
 def _run_hf_greedy(prompt: str, max_tokens: int):
     """Reference: HF model.generate greedy output."""
-    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", dtype=torch.float32).to("mps")
+    device = "cuda" if torch.cuda.is_available() else "mps"
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", dtype=torch.float32).to(device)
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-    inputs = tokenizer(prompt, return_tensors="pt").to("mps")
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False)
     token_ids = out[0][inputs["input_ids"].shape[1]:].tolist()

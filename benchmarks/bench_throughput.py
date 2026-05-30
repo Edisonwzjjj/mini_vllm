@@ -1,5 +1,6 @@
 """Benchmark: HF serial vs mini-vllm M2 batched throughput."""
 
+import gc
 import time
 import random
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -51,7 +52,8 @@ def bench_hf_serial(prompts, tokenizer, model, max_tokens):
 def bench_mini_vllm(prompts, max_tokens):
     """mini-vllm batched prefill + per-sequence decode."""
     llm = LLM(model_path=MODEL_PATH, block_size=16, max_num_seqs=16,
-              max_num_batched_tokens=4096, gpu_memory_utilization=0.5)
+              max_num_batched_tokens=4096, gpu_memory_utilization=0.5,
+              deterministic=False)
     sp = SamplingParams(temperature=0.0, max_tokens=max_tokens)
     t0 = time.time()
     outputs = llm.generate(prompts, sp)
@@ -72,13 +74,20 @@ def main():
 
     # --- HF serial ---
     print("\n--- HF model.generate (serial) ---")
+    device = "cuda" if torch.cuda.is_available() else "mps"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH, dtype=torch.float32
-    ).to("mps").eval()
+        MODEL_PATH, dtype=dtype
+    ).to(device).eval()
     hf_tokens, hf_time = bench_hf_serial(prompts, tokenizer, model, MAX_TOKENS)
     hf_tps = hf_tokens / hf_time
     print(f"Total tokens: {hf_tokens}, Time: {hf_time:.2f}s, Throughput: {hf_tps:.1f} tokens/s")
     del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+        print(f"CUDA free memory before mini-vllm: {free_gb:.2f} GB")
 
     # --- mini-vllm M2 ---
     print("\n--- mini-vllm M2 (batched prefill + decode) ---")

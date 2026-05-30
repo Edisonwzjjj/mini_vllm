@@ -57,6 +57,7 @@ def make_llm(**eagle_kwargs):
         max_num_seqs=1,
         max_num_batched_tokens=4096,
         gpu_memory_utilization=0.5,
+        deterministic=False,
         **eagle_kwargs,
     )
 

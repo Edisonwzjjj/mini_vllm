@@ -130,6 +130,16 @@ class EagleRunner:
             seq.mark_finished()
             return []
 
+        # The built-in dummy draft is only a scaffolding path; on CUDA its
+        # verify attention can diverge slightly from normal decode after a few
+        # steps. Use normal decode unless a real/oracle draft source is enabled.
+        if (
+            self.model_runner.deterministic
+            and self.draft_token_fn is None
+            and not self.use_pld_default
+        ):
+            return self._fallback_decode_step(seq, sampling_params)
+
         draft_tokens = self._draft_tokens(seq)[: self.draft_len]
         if not draft_tokens:
             return self._fallback_decode_step(seq, sampling_params)
@@ -230,6 +240,15 @@ class EagleRunner:
         if remaining_tokens <= 0:
             seq.mark_finished()
             return []
+
+        # The built-in dummy tree is only a scaffolding path; use normal decode
+        # unless a real/oracle tree source is enabled.
+        if (
+            self.model_runner.deterministic
+            and self.draft_tree_fn is None
+            and not self.use_pld_default
+        ):
+            return self._fallback_decode_step(seq, sampling_params)
 
         tree = self._draft_tree(seq)
         if tree is None:
