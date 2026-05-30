@@ -28,8 +28,6 @@ class Scheduler:
     def add_seqs(self, seqs: List[Sequence]):
         """Add new sequences to the waiting queue."""
         for seq in seqs:
-            if len(self.waiting_seqs) + len(self.running_seqs) >= self.max_num_seqs:
-                break
             self.waiting_seqs.append(seq)
 
     def schedule(self) -> SchedulerOutput:
@@ -61,7 +59,10 @@ class Scheduler:
                 prefill_seqs.append(seq)
                 chunk_size = min(seq.num_prompt_tokens, remaining_budget)
                 total_tokens += chunk_size
-            return SchedulerOutput(seqs=prefill_seqs, is_prefill=True)
+            if prefill_seqs:
+                return SchedulerOutput(seqs=prefill_seqs, is_prefill=True)
+            # Waiting queue exists, but running is already full. Decode running
+            # sequences so they can finish and free capacity for waiting ones.
         if self.running_seqs:
             # Decode: run ALL running sequences together
             return SchedulerOutput(seqs=list(self.running_seqs), is_prefill=False)

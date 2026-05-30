@@ -32,7 +32,141 @@ class ModelRunner:
         self.kv_cache = self.allocate_kv_cache()
         num_blocks = self.kv_cache.shape[1]
         self.block_manager = BlockManager(self.block_size, num_blocks)
+        self._init_decode_buffers()
         apply_attention_patch(self.model)
+
+
+    def _init_decode_buffers(self):
+        """Preallocate fixed-capacity decode input buffers.
+
+        CUDA Graph capture needs stable tensor objects and preferably stable
+        shapes. This first step removes per-token `torch.tensor(...)`
+        allocations from decode input construction. We still return a dynamic
+        slice for now; later steps will replay a fixed max-batch graph.
+        """
+        self.decode_input_ids = torch.empty(
+            self.max_num_seqs, 1, dtype=torch.long, device=self.device
+        )
+        self.decode_position_ids = torch.empty(
+            self.max_num_seqs, 1, dtype=torch.long, device=self.device
+        )
+        self.decode_slot_mapping = torch.empty(
+            self.max_num_seqs, dtype=torch.long, device=self.device
+        )
+        self.decode_num_cached_after = torch.empty(
+            self.max_num_seqs, dtype=torch.long, device=self.device
+        )
+        self.decode_block_tables = torch.empty(
+            self.max_num_seqs, self.kv_cache.shape[1], dtype=torch.long, device=self.device
+        )
+        self.decode_num_blocks = torch.empty(
+            self.max_num_seqs, dtype=torch.long, device=self.device
+        )
+        self.decode_k_batch = None
+        self.decode_v_batch = None
+        self.decode_mask = None
+        self.decode_kv_capacity = 0
+        # CUDA Graph cache skeleton. Later steps will store captured graphs here.
+        # Keyed by (batch_size, kv_capacity), because both affect tensor shapes.
+        self.decode_graphs = {}
+        self.decode_graph_replay_count = 0
+        self.decode_graph_capture_count = 0
+        self._is_capturing_decode_graph = False
+
+    def _ensure_decode_attention_buffers(self, max_cached: int) -> None:
+        """Grow reusable decode attention buffers when needed.
+
+        `_build_decode_kv_batch()` used to allocate fresh `K_batch`, `V_batch`,
+        and decode masks every layer and every decode step. This is expensive
+        and not graph-friendly. Here we allocate persistent buffers and grow
+        them only when the active context length exceeds the previous capacity.
+        """
+        if self.decode_kv_capacity >= max_cached:
+            return
+
+        capacity = ((max_cached + self.block_size - 1) // self.block_size) * self.block_size
+        dtype = self.kv_cache.dtype
+        self.decode_k_batch = torch.empty(
+            self.max_num_seqs, self.num_kv_heads, capacity, self.head_dim,
+            dtype=dtype, device=self.device,
+        )
+        self.decode_v_batch = torch.empty(
+            self.max_num_seqs, self.num_kv_heads, capacity, self.head_dim,
+            dtype=dtype, device=self.device,
+        )
+        self.decode_mask = torch.empty(
+            self.max_num_seqs, 1, 1, capacity,
+            dtype=dtype, device=self.device,
+        )
+        self.decode_kv_capacity = capacity
+
+    def _prepare_decode_inputs(self, seqs: list[Sequence]):
+        """Fill preallocated decode buffers and return active batch views."""
+        bsz = len(seqs)
+        if bsz > self.max_num_seqs:
+            raise ValueError(f"decode batch size {bsz} > max_num_seqs {self.max_num_seqs}")
+        for i, seq in enumerate(seqs):
+            self.decode_input_ids[i, 0] = seq.last_token_id
+            self.decode_position_ids[i, 0] = seq.num_tokens - 1
+        return self.decode_input_ids[:bsz], self.decode_position_ids[:bsz]
+
+    def _decode_forward_static(self, bsz: int):
+        """Forward entry point for decode.
+
+        This is still eager execution. The point of this wrapper is to isolate
+        the exact model call that a later step will warm up, capture with
+        `torch.cuda.CUDAGraph`, and replay.
+        """
+        input_ids = self.decode_input_ids[:bsz]
+        position_ids = self.decode_position_ids[:bsz]
+        with torch.no_grad():
+            return self.model(input_ids=input_ids, position_ids=position_ids)
+
+    def _decode_graph_key(self, bsz: int) -> tuple[int, int]:
+        """Shape key for a future CUDA Graph decode replay."""
+        return (bsz, self.decode_kv_capacity)
+
+    def _can_use_decode_graph(self, bsz: int) -> bool:
+        """Whether this decode step is eligible for CUDA Graph replay."""
+        return (
+            self.device == "cuda"
+            and not self.deterministic
+            and bsz > 0
+            and self.decode_kv_capacity > 0
+        )
+
+    def _capture_decode_graph(self, bsz: int):
+        """Capture one eager decode forward as a CUDA Graph for this shape key."""
+        key = self._decode_graph_key(bsz)
+        for _ in range(3):
+            self._decode_forward_static(bsz)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        paged_ctx.is_capturing_decode_graph = True
+        self._is_capturing_decode_graph = True
+        try:
+            with torch.cuda.graph(graph):
+                static_outputs = self._decode_forward_static(bsz)
+        finally:
+            paged_ctx.is_capturing_decode_graph = False
+            self._is_capturing_decode_graph = False
+        self.decode_graphs[key] = (graph, static_outputs)
+        self.decode_graph_capture_count += 1
+
+    def _decode_forward(self, bsz: int):
+        """Decode forward dispatcher with minimal CUDA Graph replay support."""
+        if not self._can_use_decode_graph(bsz):
+            return self._decode_forward_static(bsz)
+
+        key = self._decode_graph_key(bsz)
+        if key not in self.decode_graphs:
+            self._capture_decode_graph(bsz)
+
+        graph, static_outputs = self.decode_graphs[key]
+        graph.replay()
+        self.decode_graph_replay_count += 1
+        return static_outputs
 
 
     def allocate_kv_cache(self):
@@ -220,21 +354,23 @@ class ModelRunner:
             out = []
             for seq in seqs:
                 logits = self.run_decode([seq])
-                if not logits:
-                    return []
+                if logits is None:
+                    return None
                 out.append(logits[0])
             return out
 
         # 1. Allocate blocks & compute per-sequence slot
-        decode_infos = []
-        for seq in seqs:
+        slot_mapping_values = []
+        num_cached_after_values = []
+        block_table_views = []
+        for i, seq in enumerate(seqs):
             total_tokens_after = seq.num_cached_tokens + 1
             num_blocks_needed = self.block_manager.num_blocks_needed(total_tokens_after)
             cur_blocks = len(seq.block_table[0])
             if cur_blocks < num_blocks_needed:
                 new_blocks = self.block_manager.try_allocate(num_blocks_needed - cur_blocks)
                 if new_blocks is None:
-                    return []  # signal OOM to caller for potential preemption
+                    return None  # signal OOM to caller for potential preemption
                 for layer in range(self.num_layers):
                     seq.block_table[layer].extend(new_blocks)
 
@@ -243,27 +379,38 @@ class ModelRunner:
             offset = new_token_pos % self.block_size
             block_id = seq.block_table[0][block_idx]
             slot = block_id * self.block_size + offset
+            slot_mapping_values.append(slot)
+            num_cached_after_values.append(total_tokens_after)
+            self.decode_slot_mapping[i] = slot
+            self.decode_num_cached_after[i] = total_tokens_after
+            num_blocks = len(seq.block_table[0])
+            self.decode_num_blocks[i] = num_blocks
+            block_table_tensor = torch.as_tensor(
+                seq.block_table[0], dtype=torch.long, device=self.device
+            )
+            self.decode_block_tables[i, :num_blocks].copy_(block_table_tensor)
+            block_table_views.append(self.decode_block_tables[i, :num_blocks])
 
-            decode_infos.append({
-                "slot": slot,
-                "block_table": seq.block_table[0],
-                "num_cached_after": total_tokens_after,
-            })
+        # 2. Fill preallocated decode input buffers
+        self._prepare_decode_inputs(seqs)
 
-        # 2. Build batch input
-        input_ids = torch.tensor(
-            [[seq.last_token_id] for seq in seqs], device=self.device
-        )  # (batch_size, 1)
-        position_ids = torch.tensor(
-            [[seq.num_tokens - 1] for seq in seqs], device=self.device
-        )  # (batch_size, 1)
+        # 3. Ensure reusable attention buffers are large enough for this step
+        bsz = len(seqs)
+        max_cached = max(num_cached_after_values)
+        self._ensure_decode_attention_buffers(max_cached)
 
-        # 3. Set paged context
+        # 4. Set paged context
         paged_ctx.kv_cache = self.kv_cache
         paged_ctx.deterministic = self.deterministic
-        paged_ctx.slot_mapping = [info["slot"] for info in decode_infos]
-        paged_ctx.block_tables = [info["block_table"] for info in decode_infos]
-        paged_ctx.num_cached_after = [info["num_cached_after"] for info in decode_infos]
+        paged_ctx.slot_mapping = self.decode_slot_mapping[:bsz]
+        paged_ctx.slot_mapping_values = slot_mapping_values
+        paged_ctx.block_tables = block_table_views
+        paged_ctx.num_cached_after = self.decode_num_cached_after[:bsz]
+        paged_ctx.num_cached_after_values = num_cached_after_values
+        paged_ctx.decode_k_batch = self.decode_k_batch[:bsz]
+        paged_ctx.decode_v_batch = self.decode_v_batch[:bsz]
+        paged_ctx.decode_mask = self.decode_mask[:bsz]
+        paged_ctx.decode_kv_capacity = self.decode_kv_capacity
         paged_ctx.is_prefill = False
         # Clear prefix cache fields to avoid stale data
         paged_ctx.prefix_lengths = None
@@ -272,15 +419,14 @@ class ModelRunner:
         if os.environ.get("MINI_VLLM_DEBUG"):
             print(f"[DECODE] {len(seqs)} seqs")
 
-        # 4. Forward
-        with torch.no_grad():
-            outputs = self.model(input_ids=input_ids, position_ids=position_ids)
+        # 5. Forward through the decode dispatcher
+        outputs = self._decode_forward(bsz)
 
         # 5. Update num_cached_tokens & extract logits
         logits_list = []
         for i, seq in enumerate(seqs):
             seq.num_cached_tokens += 1
-            logits_list.append(outputs.logits[i, -1, :])  # (vocab_size,)
+            logits_list.append(outputs.logits[i, -1, :].clone())  # (vocab_size,)
 
         return logits_list
 

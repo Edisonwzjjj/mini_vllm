@@ -100,16 +100,19 @@ def _write_prefill_kv(
 def _write_decode_kv(
     kv_cache: torch.Tensor,
     layer_idx: int,
-    slot_mapping: list[int],
+    slot_mapping: list[int] | torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
     block_size: int,
     bsz: int,
 ) -> None:
-    slots = torch.tensor(slot_mapping, device=kv_cache.device)
+    slots = slot_mapping
 
     for i in range(bsz):
-        slot = slots[i].item()
+        if isinstance(slots, torch.Tensor):
+            slot = int(slots[i].item())
+        else:
+            slot = int(slots[i])
         bid = slot // block_size
         off = slot % block_size
         kv_cache[layer_idx, bid, 0, :, off, :] = key_states[i, :, 0, :]
@@ -119,11 +122,13 @@ def _write_decode_kv(
 def _read_kv_from_blocks(
     kv_cache: torch.Tensor,
     layer_idx: int,
-    block_table: list[int],
+    block_table: list[int] | torch.Tensor,
     total_len: int,
     num_kv_heads: int,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(block_table, torch.Tensor):
+        block_table = block_table.to(device=kv_cache.device, dtype=torch.long)
     K_blocks = kv_cache[layer_idx, block_table, 0]
     V_blocks = kv_cache[layer_idx, block_table, 1]
     K_full = K_blocks.permute(1, 0, 2, 3).reshape(
@@ -158,6 +163,15 @@ def _sdpa(
             V = V.to(q_dtype)
         if attn_mask is not None and attn_mask.dtype != q_dtype:
             attn_mask = attn_mask.to(q_dtype)
+        if getattr(paged_ctx, "is_capturing_decode_graph", False):
+            return torch.matmul(
+                torch.softmax(
+                    torch.matmul(query_states, K.transpose(-2, -1)) / (query_states.shape[-1] ** 0.5)
+                    + (attn_mask if attn_mask is not None else 0),
+                    dim=-1,
+                ),
+                V,
+            )
         return F.scaled_dot_product_attention(
             query_states, K, V, attn_mask=attn_mask, is_causal=is_causal
         )
@@ -196,14 +210,30 @@ def _build_suffix_prefill_mask(prefix_len: int, suffix_len: int, device: torch.d
 
 def _build_decode_mask(
     bsz: int,
-    max_cached: int,
-    num_cached_list: list[int],
+    k_len: int,
+    num_cached_list: list[int] | torch.Tensor,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    mask = torch.zeros(bsz, 1, 1, max_cached, device=device, dtype=dtype)
+    num_cached_values = getattr(paged_ctx, "num_cached_after_values", None)
+    if num_cached_values is None:
+        if isinstance(num_cached_list, torch.Tensor):
+            num_cached_values = num_cached_list.tolist()
+        else:
+            num_cached_values = num_cached_list
+
+    mask = getattr(paged_ctx, "decode_mask", None)
+    if mask is None:
+        mask = torch.empty(bsz, 1, 1, k_len, device=device, dtype=dtype)
+    else:
+        mask = mask[:bsz]
+        if mask.dtype != dtype:
+            mask = mask.to(dtype=dtype)
+        k_len = mask.shape[-1]
+
+    mask.zero_()
     for i in range(bsz):
-        mask[i, 0, 0, num_cached_list[i]:] = float("-inf")
+        mask[i, 0, 0, int(num_cached_values[i]):k_len] = float("-inf")
     return mask
 
 
@@ -306,31 +336,47 @@ def _suffix_prefill_attention(
 def _build_decode_kv_batch(
     kv_cache: torch.Tensor,
     layer_idx: int,
-    block_tables: list[list[int]],
-    num_cached_list: list[int],
+    block_tables: list[list[int] | torch.Tensor],
+    num_cached_list: list[int] | torch.Tensor,
     meta: AttentionMeta,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    max_cached = max(num_cached_list)
-    K_batch = kv_cache.new_zeros(
-        meta["bsz"], meta["num_kv_heads"], max_cached, meta["head_dim"]
-    )
-    V_batch = kv_cache.new_zeros(
-        meta["bsz"], meta["num_kv_heads"], max_cached, meta["head_dim"]
-    )
+    num_cached_values = getattr(paged_ctx, "num_cached_after_values", None)
+    if num_cached_values is None:
+        if isinstance(num_cached_list, torch.Tensor):
+            num_cached_values = num_cached_list.tolist()
+        else:
+            num_cached_values = num_cached_list
+    max_cached = max(num_cached_values)
+
+    K_batch = getattr(paged_ctx, "decode_k_batch", None)
+    V_batch = getattr(paged_ctx, "decode_v_batch", None)
+    if K_batch is None or V_batch is None:
+        K_batch = kv_cache.new_empty(
+            meta["bsz"], meta["num_kv_heads"], max_cached, meta["head_dim"]
+        )
+        V_batch = kv_cache.new_empty(
+            meta["bsz"], meta["num_kv_heads"], max_cached, meta["head_dim"]
+        )
+        k_len = max_cached
+    else:
+        K_batch = K_batch[:meta["bsz"]]
+        V_batch = V_batch[:meta["bsz"]]
+        k_len = K_batch.shape[2]
 
     for i, block_table in enumerate(block_tables):
+        num_cached = int(num_cached_values[i])
         K_full, V_full = _read_kv_from_blocks(
             kv_cache,
             layer_idx,
             block_table,
-            num_cached_list[i],
+            num_cached,
             meta["num_kv_heads"],
             meta["head_dim"],
         )
-        K_batch[i, :, :num_cached_list[i], :] = K_full
-        V_batch[i, :, :num_cached_list[i], :] = V_full
+        K_batch[i, :, :num_cached, :] = K_full
+        V_batch[i, :, :num_cached, :] = V_full
 
-    return K_batch, V_batch, max_cached
+    return K_batch, V_batch, k_len
 
 
 def _decode_attention(
@@ -348,14 +394,14 @@ def _decode_attention(
     _write_decode_kv(
         kv_cache,
         meta["layer_idx"],
-        paged_ctx.slot_mapping,
+        getattr(paged_ctx, "slot_mapping_values", paged_ctx.slot_mapping),
         key_states,
         value_states,
         block_size,
         meta["bsz"],
     )
 
-    K_batch, V_batch, max_cached = _build_decode_kv_batch(
+    K_batch, V_batch, k_len = _build_decode_kv_batch(
         kv_cache,
         meta["layer_idx"],
         block_tables,
@@ -364,7 +410,7 @@ def _decode_attention(
     )
     K_expanded = repeat_kv(K_batch, self.num_key_value_groups)
     V_expanded = repeat_kv(V_batch, self.num_key_value_groups)
-    mask = _build_decode_mask(meta["bsz"], max_cached, num_cached_list, kv_cache.device, K_expanded.dtype)
+    mask = _build_decode_mask(meta["bsz"], k_len, num_cached_list, kv_cache.device, K_expanded.dtype)
 
     return _sdpa(
         query_states,

@@ -118,9 +118,19 @@ class LLMEngine:
         """Tokenize prompts → run engine loop → return results."""
         seqs = self._create_sequences(prompts)
         self.scheduler.add_seqs(seqs)
-
+        step_count = 0
+        max_steps = (sampling_params.max_tokens + 50) * len(seqs) + 100
+        
         while not all(seq.is_finished() for seq in seqs):
             self.step(sampling_params)
+            step_count += 1
+            if step_count > max_steps:
+                unfinished = [s for s in seqs if not s.is_finished()]
+                raise RuntimeError(f"Engine stuck after {step_count} steps (max={max_steps}). "
+                f"Unfinished: " + ", ".join(
+                f"id={s.seq_id} out={s.num_output_tokens} "
+                f"prefill_done={s.is_prefill_finished} status={s.status}"
+                for s in unfinished))
 
         outputs = []
         for seq in seqs:

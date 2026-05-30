@@ -59,6 +59,12 @@ def bench_mini_vllm(prompts, max_tokens):
     outputs = llm.generate(prompts, sp)
     elapsed = time.time() - t0
     total_tokens = sum(len(o["token_ids"]) for o in outputs)
+    mr = llm.engine.model_runner
+    print(
+        f"CUDA graphs: captures={mr.decode_graph_capture_count}, "
+        f"replays={mr.decode_graph_replay_count}, "
+        f"keys={list(mr.decode_graphs.keys())}"
+    )
     return total_tokens, elapsed
 
 
