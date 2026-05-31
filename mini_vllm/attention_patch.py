@@ -8,6 +8,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     apply_rotary_pos_emb,
     repeat_kv,
 )
+from mini_vllm.kv_quant import FP8_DTYPE, dequantize_from_fp8, quantize_to_fp8
 
 
 AttentionMode = Literal["prefill", "suffix_prefill", "decode", "tree_verify"]
@@ -26,6 +27,8 @@ class PageContext:
     attn_mask: torch.Tensor # (total_len, total_len) block-diagonal causal mask for prefill
     prefix_lengths: list[int]
     suffix_lengths: list[int]
+    kv_scale: float | None = None
+    compute_dtype: torch.dtype = torch.bfloat16
     tree_mask: torch.Tensor  # (num_draft, num_draft), used by tree verify
 
 
@@ -88,6 +91,12 @@ def _write_prefill_kv(
     slots = torch.tensor(slot_mapping, device=kv_cache.device)
     K_write = key_states[0].transpose(0, 1)
     V_write = value_states[0].transpose(0, 1)
+    if kv_cache.dtype == FP8_DTYPE:
+        kv_scale = getattr(paged_ctx, "kv_scale", None)
+        if kv_scale is None:
+            raise ValueError("fp8_e4m3 KV requires paged_ctx.kv_scale")
+        K_write = quantize_to_fp8(K_write, kv_scale)
+        V_write = quantize_to_fp8(V_write, kv_scale)
 
     for t in range(K_write.size(0)):
         slot = slots[t].item()
@@ -107,6 +116,14 @@ def _write_decode_kv(
     bsz: int,
 ) -> None:
     slots = slot_mapping
+    K_write = key_states[:, :, 0, :]
+    V_write = value_states[:, :, 0, :]
+    if kv_cache.dtype == FP8_DTYPE:
+        kv_scale = getattr(paged_ctx, "kv_scale", None)
+        if kv_scale is None:
+            raise ValueError("fp8_e4m3 KV requires paged_ctx.kv_scale")
+        K_write = quantize_to_fp8(K_write, kv_scale)
+        V_write = quantize_to_fp8(V_write, kv_scale)
 
     for i in range(bsz):
         if isinstance(slots, torch.Tensor):
@@ -115,8 +132,8 @@ def _write_decode_kv(
             slot = int(slots[i])
         bid = slot // block_size
         off = slot % block_size
-        kv_cache[layer_idx, bid, 0, :, off, :] = key_states[i, :, 0, :]
-        kv_cache[layer_idx, bid, 1, :, off, :] = value_states[i, :, 0, :]
+        kv_cache[layer_idx, bid, 0, :, off, :] = K_write[i]
+        kv_cache[layer_idx, bid, 1, :, off, :] = V_write[i]
 
 
 def _read_kv_from_blocks(
@@ -131,6 +148,13 @@ def _read_kv_from_blocks(
         block_table = block_table.to(device=kv_cache.device, dtype=torch.long)
     K_blocks = kv_cache[layer_idx, block_table, 0]
     V_blocks = kv_cache[layer_idx, block_table, 1]
+    if kv_cache.dtype == FP8_DTYPE:
+        kv_scale = getattr(paged_ctx, "kv_scale", None)
+        if kv_scale is None:
+            raise ValueError("fp8_e4m3 KV requires paged_ctx.kv_scale")
+        compute_dtype = getattr(paged_ctx, "compute_dtype", torch.bfloat16)
+        K_blocks = dequantize_from_fp8(K_blocks, kv_scale, compute_dtype)
+        V_blocks = dequantize_from_fp8(V_blocks, kv_scale, compute_dtype)
     K_full = K_blocks.permute(1, 0, 2, 3).reshape(
         num_kv_heads, -1, head_dim
     )[:, :total_len, :]
@@ -351,11 +375,14 @@ def _build_decode_kv_batch(
     K_batch = getattr(paged_ctx, "decode_k_batch", None)
     V_batch = getattr(paged_ctx, "decode_v_batch", None)
     if K_batch is None or V_batch is None:
-        K_batch = kv_cache.new_empty(
-            meta["bsz"], meta["num_kv_heads"], max_cached, meta["head_dim"]
+        compute_dtype = getattr(paged_ctx, "compute_dtype", torch.bfloat16)
+        K_batch = torch.empty(
+            meta["bsz"], meta["num_kv_heads"], max_cached, meta["head_dim"],
+            dtype=compute_dtype, device=kv_cache.device,
         )
-        V_batch = kv_cache.new_empty(
-            meta["bsz"], meta["num_kv_heads"], max_cached, meta["head_dim"]
+        V_batch = torch.empty(
+            meta["bsz"], meta["num_kv_heads"], max_cached, meta["head_dim"],
+            dtype=compute_dtype, device=kv_cache.device,
         )
         k_len = max_cached
     else:

@@ -37,6 +37,9 @@ class LLMEngine:
             max_num_batched_tokens=config.max_num_batched_tokens,
             gpu_memory_utilization=config.gpu_memory_utilization,
             deterministic=config.deterministic,
+            kv_cache_dtype=config.kv_cache_dtype,
+            kv_scale=config.kv_scale,
+            kv_scale_calib_tokens=config.kv_scale_calib_tokens,
         )
         self.scheduler = Scheduler(config.max_num_seqs, config.max_num_batched_tokens,
                                   self.model_runner.block_manager)
@@ -185,7 +188,10 @@ class LLM:
                  eagle_use_pld: bool = False,
                  eagle_pld_max_ngram: int = 3,
                  eagle_pld_min_ngram: int = 2,
-                 deterministic: bool = True):
+                 deterministic: bool = True,
+                 kv_cache_dtype: str = "auto",
+                 kv_scale: float | None = None,
+                 kv_scale_calib_tokens: int = 4096):
         config = EngineConfig(
             model_path=model_path,
             block_size=block_size,
@@ -201,6 +207,9 @@ class LLM:
             eagle_pld_max_ngram=eagle_pld_max_ngram,
             eagle_pld_min_ngram=eagle_pld_min_ngram,
             deterministic=deterministic,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_scale=kv_scale,
+            kv_scale_calib_tokens=kv_scale_calib_tokens,
         )
         self.engine = LLMEngine(config)
 

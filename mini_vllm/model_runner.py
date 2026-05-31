@@ -7,20 +7,30 @@ from mini_vllm.attention_patch import apply_attention_patch, paged_ctx
 from mini_vllm.sequence import Sequence
 from mini_vllm.block_manager import BlockManager
 from mini_vllm.draft_tree import DraftTree
+from mini_vllm.kv_quant import calibrate_scale
+
+
 class ModelRunner:
     def __init__(self, model_path: str, block_size: int, max_num_seqs: int,
                  max_num_batched_tokens: int, gpu_memory_utilization: float,
-                 deterministic: bool = True):
+                 deterministic: bool = True, kv_cache_dtype: str = "auto",
+                 kv_scale: float | None = None, kv_scale_calib_tokens: int = 4096):
         self.device = ("cuda" if torch.cuda.is_available() else "mps" )
+        self.deterministic = deterministic
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_scale = float(kv_scale) if kv_scale is not None else None
+        self.kv_scale_calib_tokens = kv_scale_calib_tokens
+        self._validate_kv_config()
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path, dtype=torch.bfloat16
         ).to(self.device).eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.compute_dtype = next(self.model.parameters()).dtype
         self.block_size = block_size
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.gpu_memory_utilization = gpu_memory_utilization
-        self.deterministic = deterministic
 
         # Read model dimensions from config
         cfg = self.model.config
@@ -28,12 +38,89 @@ class ModelRunner:
         self.num_kv_heads = cfg.num_key_value_heads
         self.head_dim = cfg.head_dim
         self.eos_token_id = cfg.eos_token_id
+        self._validate_kv_config()
+        if self.kv_cache_dtype == "fp8_e4m3" and self.kv_scale is None:
+            self.kv_scale = self._calibrate_kv_scale()
         
         self.kv_cache = self.allocate_kv_cache()
         num_blocks = self.kv_cache.shape[1]
         self.block_manager = BlockManager(self.block_size, num_blocks)
         self._init_decode_buffers()
         apply_attention_patch(self.model)
+
+    def _validate_kv_config(self) -> None:
+        valid = {"auto", "fp32", "bf16", "fp8_e4m3"}
+        if self.kv_cache_dtype not in valid:
+            raise ValueError(f"Unsupported kv_cache_dtype: {self.kv_cache_dtype}")
+        if self.kv_scale is not None and self.kv_scale <= 0:
+            raise ValueError("kv_scale must be positive")
+        if self.kv_scale_calib_tokens <= 0:
+            raise ValueError("kv_scale_calib_tokens must be positive")
+        if self.kv_cache_dtype == "fp8_e4m3":
+            if self.deterministic:
+                raise ValueError("fp8_e4m3 KV requires deterministic=False")
+            if self.device != "cuda":
+                raise ValueError("fp8_e4m3 KV requires CUDA")
+            if not hasattr(torch, "float8_e4m3fn"):
+                raise ValueError("fp8_e4m3 KV requires torch.float8_e4m3fn support")
+
+    def _resolve_kv_dtype(self) -> torch.dtype:
+        if self.kv_cache_dtype == "fp8_e4m3":
+            if self.kv_scale is None:
+                raise ValueError("fp8_e4m3 KV requires kv_scale or successful calibration")
+            return torch.float8_e4m3fn
+        if self.kv_cache_dtype == "bf16":
+            return torch.bfloat16
+        if self.kv_cache_dtype in {"auto", "fp32"}:
+            return torch.float32
+        raise ValueError(f"Unsupported kv_cache_dtype: {self.kv_cache_dtype}")
+
+    def _calibrate_kv_scale(self) -> float:
+        absmax = 0.0
+
+        def collect_absmax(_module, _inputs, output):
+            nonlocal absmax
+            tensor = output[0] if isinstance(output, tuple) else output
+            if torch.is_tensor(tensor):
+                absmax = max(absmax, float(tensor.detach().float().abs().max().item()))
+
+        hooks = []
+        for layer in self.model.model.layers:
+            attn = layer.self_attn
+            hooks.append(attn.k_norm.register_forward_hook(collect_absmax))
+            hooks.append(attn.v_proj.register_forward_hook(collect_absmax))
+
+        seed = (
+            "The quick brown fox jumps over the lazy dog. "
+            "KV cache calibration observes representative key and value activations. "
+            "Attention mechanisms store previous tokens for efficient autoregressive decoding. "
+        )
+        token_ids = self.tokenizer.encode(seed)
+        while len(token_ids) < self.kv_scale_calib_tokens:
+            token_ids.extend(token_ids)
+        token_ids = token_ids[:self.kv_scale_calib_tokens]
+
+        max_chunk = 512
+        try:
+            with torch.no_grad():
+                for start in range(0, len(token_ids), max_chunk):
+                    chunk = token_ids[start:start + max_chunk]
+                    input_ids = torch.tensor([chunk], dtype=torch.long, device=self.device)
+                    position_ids = torch.arange(len(chunk), dtype=torch.long, device=self.device).unsqueeze(0)
+                    self.model(input_ids=input_ids, position_ids=position_ids)
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        scale = calibrate_scale(absmax)
+        print(f"KV FP8 calibration: kv_scale={scale:.6g} (absmax={absmax:.6g}, tokens={len(token_ids)})")
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+        return scale
+
+    def _set_kv_runtime_context(self) -> None:
+        paged_ctx.kv_scale = self.kv_scale
+        paged_ctx.compute_dtype = self.compute_dtype
 
 
     def _init_decode_buffers(self):
@@ -85,7 +172,7 @@ class ModelRunner:
             return
 
         capacity = ((max_cached + self.block_size - 1) // self.block_size) * self.block_size
-        dtype = self.kv_cache.dtype
+        dtype = self.compute_dtype
         self.decode_k_batch = torch.empty(
             self.max_num_seqs, self.num_kv_heads, capacity, self.head_dim,
             dtype=dtype, device=self.device,
@@ -178,11 +265,10 @@ class ModelRunner:
         On CUDA we use gpu_memory_utilization * free_memory to size the cache.
         On MPS we can't query available VRAM precisely, so use a fixed pool size.
 
-        We use float32 KV cache (not the model's bf16) for numerical stability:
-        bf16 KV accumulates rounding error and breaks bit-exact greedy
-        equivalence between batched/single and prefix-cached/full prefill.
+        Default/auto keeps float32 KV for deterministic bit-exact tests. Fast
+        mode can opt into bf16 or fp8_e4m3 storage through kv_cache_dtype.
         """
-        kv_dtype = torch.float32
+        kv_dtype = self._resolve_kv_dtype()
         bytes_per_elem = torch.tensor([], dtype=kv_dtype).element_size()
         # Each block (per layer) stores: 2 * num_kv_heads * block_size * head_dim values
         bytes_per_block = (
@@ -210,8 +296,9 @@ class ModelRunner:
             dtype=kv_dtype, device=self.device,
         )
         total_gb = kv_cache.nelement() * bytes_per_elem / 1024**3
+        scale_info = f", scale={self.kv_scale:.6g}" if self.kv_scale is not None else ""
         print(f"KV cache: {num_blocks} blocks/layer × {self.num_layers} layers, "
-              f"{total_gb:.2f} GB ({kv_dtype})")
+              f"{total_gb:.2f} GB ({kv_dtype}{scale_info})")
         return kv_cache
 
     def run_prefill(self, seqs: list[Sequence]):
@@ -307,6 +394,7 @@ class ModelRunner:
         mask = mask.masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, 0.0)
 
         # 3. Set paged context
+        self._set_kv_runtime_context()
         paged_ctx.kv_cache = self.kv_cache
         paged_ctx.deterministic = self.deterministic
         paged_ctx.slot_mapping = all_slots
@@ -400,6 +488,7 @@ class ModelRunner:
         self._ensure_decode_attention_buffers(max_cached)
 
         # 4. Set paged context
+        self._set_kv_runtime_context()
         paged_ctx.kv_cache = self.kv_cache
         paged_ctx.deterministic = self.deterministic
         paged_ctx.slot_mapping = self.decode_slot_mapping[:bsz]
@@ -461,6 +550,7 @@ class ModelRunner:
             [list(range(old_num_cached, target_num_cached))], device=self.device
         )
 
+        self._set_kv_runtime_context()
         paged_ctx.kv_cache = self.kv_cache
         paged_ctx.deterministic = self.deterministic
         paged_ctx.slot_mapping = suffix_slot_mapping
@@ -511,6 +601,7 @@ class ModelRunner:
             [list(range(old_num_cached, target_num_cached))], device=self.device
         )
 
+        self._set_kv_runtime_context()
         paged_ctx.kv_cache = self.kv_cache
         paged_ctx.deterministic = self.deterministic
         paged_ctx.slot_mapping = suffix_slot_mapping

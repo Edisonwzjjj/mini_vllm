@@ -1,5 +1,6 @@
 """Benchmark: HF serial vs mini-vllm M2 batched throughput."""
 
+import argparse
 import gc
 import time
 import random
@@ -8,7 +9,7 @@ import torch
 from mini_vllm import LLM, SamplingParams
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
-NUM_REQUESTS = 16
+NUM_REQUESTS = 32
 MIN_PROMPT_LEN = 50
 MAX_PROMPT_LEN = 500
 MAX_TOKENS = 100
@@ -19,7 +20,7 @@ def generate_random_prompts(tokenizer, n, min_len, max_len):
     random.seed(42)
     prompts = []
     for _ in range(n):
-        target_len = random.randint(min_len, max_len)
+        target_len = 250
         # Use repeating words to reach target length
         words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
                  "and", "a", "in", "to", "of", "is", "it", "that", "was", "for"]
@@ -49,11 +50,13 @@ def bench_hf_serial(prompts, tokenizer, model, max_tokens):
     return total_tokens, elapsed
 
 
-def bench_mini_vllm(prompts, max_tokens):
+def bench_mini_vllm(prompts, max_tokens, kv_dtype, kv_scale, kv_scale_calib_tokens,
+                    max_num_seqs, gpu_memory_utilization):
     """mini-vllm batched prefill + per-sequence decode."""
-    llm = LLM(model_path=MODEL_PATH, block_size=16, max_num_seqs=16,
-              max_num_batched_tokens=4096, gpu_memory_utilization=0.5,
-              deterministic=False)
+    llm = LLM(model_path=MODEL_PATH, block_size=16, max_num_seqs=max_num_seqs,
+              max_num_batched_tokens=4096, gpu_memory_utilization=gpu_memory_utilization,
+              deterministic=False, kv_cache_dtype=kv_dtype,
+              kv_scale=kv_scale, kv_scale_calib_tokens=kv_scale_calib_tokens)
     sp = SamplingParams(temperature=0.0, max_tokens=max_tokens)
     t0 = time.time()
     outputs = llm.generate(prompts, sp)
@@ -69,6 +72,19 @@ def bench_mini_vllm(prompts, max_tokens):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--kv-dtype", choices=["bf16", "fp8_e4m3"], default="bf16")
+    parser.add_argument("--kv-scale", type=float, default=None)
+    parser.add_argument("--kv-scale-calib-tokens", type=int, default=4096)
+    parser.add_argument("--max-num-seqs", type=int, default=32)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=None)
+    args = parser.parse_args()
+    gpu_memory_utilization = (
+        args.gpu_memory_utilization
+        if args.gpu_memory_utilization is not None
+        else (0.25 if args.kv_dtype == "fp8_e4m3" else 0.5)
+    )
+
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
@@ -96,8 +112,14 @@ def main():
         print(f"CUDA free memory before mini-vllm: {free_gb:.2f} GB")
 
     # --- mini-vllm M2 ---
-    print("\n--- mini-vllm M2 (batched prefill + decode) ---")
-    mv_tokens, mv_time = bench_mini_vllm(prompts, MAX_TOKENS)
+    print(
+        f"\n--- mini-vllm M2 (batched prefill + decode, kv={args.kv_dtype}, "
+        f"max_num_seqs={args.max_num_seqs}, gpu_mem={gpu_memory_utilization}) ---"
+    )
+    mv_tokens, mv_time = bench_mini_vllm(
+        prompts, MAX_TOKENS, args.kv_dtype, args.kv_scale, args.kv_scale_calib_tokens,
+        args.max_num_seqs, gpu_memory_utilization
+    )
     mv_tps = mv_tokens / mv_time
     print(f"Total tokens: {mv_tokens}, Time: {mv_time:.2f}s, Throughput: {mv_tps:.1f} tokens/s")
 
@@ -107,7 +129,7 @@ def main():
     print(f"{'Method':<30} {'tokens/s':>10} {'Speedup':>8}")
     print(f"{'-'*50}")
     print(f"{'HF generate (serial)':<30} {hf_tps:>10.1f} {'1.0x':>8}")
-    print(f"{'mini-vllm M2':<30} {mv_tps:>10.1f} {f'{speedup:.1f}x':>8}")
+    print(f"{f'mini-vllm M2 ({args.kv_dtype})':<30} {mv_tps:>10.1f} {f'{speedup:.1f}x':>8}")
     print(f"{'='*50}")
     if speedup >= 4.0:
         print("PASS: M2 throughput >= 4x serial HF")
