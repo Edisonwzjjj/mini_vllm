@@ -15,7 +15,7 @@ class ModelRunner:
                  max_num_batched_tokens: int, gpu_memory_utilization: float,
                  deterministic: bool = True, kv_cache_dtype: str = "auto",
                  kv_scale: float | None = None, kv_scale_calib_tokens: int = 4096):
-        self.device = ("cuda" if torch.cuda.is_available() else "mps" )
+        self.device = ("cuda" if torch.cuda.is_available() else "cpu" )
         self.deterministic = deterministic
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_scale = float(kv_scale) if kv_scale is not None else None

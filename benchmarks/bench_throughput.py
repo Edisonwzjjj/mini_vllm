@@ -96,7 +96,7 @@ def main():
 
     # --- HF serial ---
     print("\n--- HF model.generate (serial) ---")
-    device = "cuda" if torch.cuda.is_available() else "mps"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH, dtype=dtype
