@@ -57,7 +57,7 @@ class LLMEngine:
         seq.output_token_ids.append(token_id)
 
         is_finished = (
-            token_id == self.model_runner.eos_token_id
+            self.model_runner.is_eos(token_id)
             or seq.num_output_tokens >= sampling_params.max_tokens
         )
         if is_finished:

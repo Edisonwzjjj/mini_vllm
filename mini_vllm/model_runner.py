@@ -34,10 +34,13 @@ class ModelRunner:
 
         # Read model dimensions from config
         cfg = self.model.config
-        self.num_layers = cfg.num_hidden_layers
-        self.num_kv_heads = cfg.num_key_value_heads
-        self.head_dim = cfg.head_dim
+        self.num_layers = self._required_config_int(cfg, "num_hidden_layers")
+        self.num_heads = self._required_config_int(cfg, "num_attention_heads")
+        self.num_kv_heads = self._resolve_num_kv_heads(cfg)
+        self.head_dim = self._resolve_head_dim(cfg)
         self.eos_token_id = cfg.eos_token_id
+        self.eos_token_ids = self._normalize_eos_token_ids(cfg.eos_token_id)
+        self._validate_model_layout()
         self._validate_kv_config()
         if self.kv_cache_dtype == "fp8_e4m3" and self.kv_scale is None:
             self.kv_scale = self._calibrate_kv_scale()
@@ -47,6 +50,69 @@ class ModelRunner:
         self.block_manager = BlockManager(self.block_size, num_blocks)
         self._init_decode_buffers()
         apply_attention_patch(self.model)
+
+    @staticmethod
+    def _required_config_int(cfg, name: str) -> int:
+        value = getattr(cfg, name, None)
+        if value is None:
+            raise ValueError(f"Model config is missing required field {name!r}")
+        return int(value)
+
+    def _resolve_num_kv_heads(self, cfg) -> int:
+        value = getattr(cfg, "num_key_value_heads", None)
+        if value is None:
+            value = getattr(cfg, "num_attention_heads", None)
+        if value is None:
+            raise ValueError("Model config is missing num_key_value_heads/num_attention_heads")
+        return int(value)
+
+    def _resolve_head_dim(self, cfg) -> int:
+        value = getattr(cfg, "head_dim", None)
+        if value is not None:
+            return int(value)
+        hidden_size = getattr(cfg, "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError("Model config is missing head_dim and hidden_size")
+        hidden_size = int(hidden_size)
+        if hidden_size % self.num_heads != 0:
+            raise ValueError(
+                f"Cannot infer head_dim: hidden_size={hidden_size} "
+                f"is not divisible by num_attention_heads={self.num_heads}"
+            )
+        return hidden_size // self.num_heads
+
+    @staticmethod
+    def _normalize_eos_token_ids(eos_token_id) -> set[int]:
+        if eos_token_id is None:
+            return set()
+        if isinstance(eos_token_id, (list, tuple, set)):
+            return {int(token_id) for token_id in eos_token_id}
+        return {int(eos_token_id)}
+
+    def is_eos(self, token_id: int) -> bool:
+        return int(token_id) in self.eos_token_ids
+
+    def _validate_model_layout(self) -> None:
+        if not hasattr(self.model, "model") or not hasattr(self.model.model, "layers"):
+            raise ValueError(
+                "mini-vllm currently expects HuggingFace causal LM models with "
+                "`model.layers` and `layer.self_attn`, such as Qwen3/Qwen3-Coder."
+            )
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError(
+                f"num_attention_heads ({self.num_heads}) must be divisible by "
+                f"num_key_value_heads ({self.num_kv_heads})"
+            )
+        missing = []
+        first_attn = self.model.model.layers[0].self_attn
+        for name in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"):
+            if not hasattr(first_attn, name):
+                missing.append(name)
+        if missing:
+            raise ValueError(
+                "mini-vllm attention patch only supports Qwen-style attention; "
+                f"missing fields on first self_attn: {missing}"
+            )
 
     def _validate_kv_config(self) -> None:
         valid = {"auto", "fp32", "bf16", "fp8_e4m3"}
