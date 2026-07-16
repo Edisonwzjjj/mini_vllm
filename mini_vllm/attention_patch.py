@@ -1,5 +1,7 @@
 """Attention monkey-patch — replace Qwen3Attention.forward to use our paged KV cache."""
 
+from __future__ import annotations
+
 from typing import Any, Literal
 
 import torch

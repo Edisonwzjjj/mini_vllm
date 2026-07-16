@@ -1,5 +1,7 @@
 """Model runner — loads HF model, allocates KV cache, runs forward passes."""
 
+from __future__ import annotations
+
 import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM

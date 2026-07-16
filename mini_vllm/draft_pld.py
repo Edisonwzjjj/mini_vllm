@@ -10,6 +10,8 @@ Two flavours:
 
 Reference: https://github.com/apoorvumang/prompt-lookup-decoding
 """
+from __future__ import annotations
+
 from mini_vllm.draft_tree import DraftTree
 
 

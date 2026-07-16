@@ -1,5 +1,7 @@
 """LLMEngine — main entry point orchestrating scheduler + model runner + block manager."""
 
+from __future__ import annotations
+
 import torch
 from .scheduler import Scheduler
 from .model_runner import ModelRunner

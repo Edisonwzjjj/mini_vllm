@@ -2,9 +2,9 @@
 name = "mini-vllm"
 version = "0.1.0"
 description = "Your first inference engine — scheduling + KV management layer"
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 dependencies = [
-    "torch>=2.7",
+    "torch>=2.1",
     "transformers>=4.52",
     "xxhash>=3.5",
     "safetensors>=0.5",

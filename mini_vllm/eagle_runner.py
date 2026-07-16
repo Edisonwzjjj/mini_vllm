@@ -1,5 +1,7 @@
 """Chain speculative decoding runner for M5 EAGLE groundwork."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Callable
 
