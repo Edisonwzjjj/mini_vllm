@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import torch
 from .scheduler import Scheduler
 from .model_runner import ModelRunner
@@ -9,6 +11,19 @@ from .sequence import Sequence
 from .sampling_params import SamplingParams
 from .config import EngineConfig
 from .eagle_runner import EagleRunner
+
+
+def _now_s() -> float:
+    """Wall-clock timestamp, synchronized with any in-flight CUDA work.
+
+    Used for per-request TTFT/TPOT timestamps. Without the sync, a timestamp
+    taken right after launching (but not waiting for) a GPU kernel would
+    measure "time to enqueue the kernel", not "time for the token to actually
+    be produced".
+    """
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
 
 def sample_token(logits: torch.Tensor, sampling_params: SamplingParams) -> int:
     """Sample a single token from logits.
@@ -95,16 +110,20 @@ class LLMEngine:
                     continue
                 results.append(self._sample_and_append(seq, logits, sampling_params))
         else:
-            if (
-                self.spec_runner is not None
-                and self.spec_runner.draft_len > 0
-                and len(seqs) == 1  # spec_runner only supports batch_size=1 for now
-            ):
-                seq = seqs[0]
-                results.extend(self.spec_runner.step(seq, sampling_params))
-                if seq.is_finished():
-                    self.scheduler.postprocess(seq)
-                    self._free_seq_resources(seq)
+            if self.spec_runner is not None and self.spec_runner.draft_len > 0:
+                step_results = self.spec_runner.step_batch(seqs, sampling_params)
+                if step_results is None:
+                    victim = self.scheduler.preempt_one()
+                    if victim is None:
+                        raise RuntimeError("OOM: no sequence to preempt")
+                    self._free_seq_resources(victim)
+                    print(f"[PREEMPT] seq_id={victim.seq_id}, released blocks")
+                    return []
+                results.extend(step_results)
+                for seq in seqs:
+                    if seq.is_finished():
+                        self.scheduler.postprocess(seq)
+                        self._free_seq_resources(seq)
             else:
                 logits_list = self.model_runner.run_decode(seqs)
                 if logits_list is None:
@@ -120,14 +139,38 @@ class LLMEngine:
         return results
 
     def generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[dict]:
-        """Tokenize prompts → run engine loop → return results."""
+        """Tokenize prompts → run engine loop → return results.
+
+        Also records true per-request TTFT/TPOT:
+          - t_submit: right before the first step() call (request enters the engine)
+          - first_token_t: timestamp of this seq's first output token
+          - last_token_t: timestamp of this seq's last output token
+          - ttft_s  = first_token_t - t_submit
+          - tpot_s  = (last_token_t - first_token_t) / (num_output_tokens - 1)
+                      (None if only 1 output token — no inter-token interval to measure)
+
+        Timestamps are taken once per step() call (not per token inside a
+        batched step), synchronized with CUDA so they reflect when the GPU
+        work actually finished, not just when it was enqueued.
+        """
         seqs = self._create_sequences(prompts)
         self.scheduler.add_seqs(seqs)
         step_count = 0
         max_steps = (sampling_params.max_tokens + 50) * len(seqs) + 100
-        
+
+        t_submit = _now_s()
+        first_token_t: dict[int, float] = {}
+        last_token_t: dict[int, float] = {}
+
         while not all(seq.is_finished() for seq in seqs):
-            self.step(sampling_params)
+            step_results = self.step(sampling_params)
+            if step_results:
+                t_now = _now_s()
+                for r in step_results:
+                    sid = r["seq_id"]
+                    if sid not in first_token_t:
+                        first_token_t[sid] = t_now
+                    last_token_t[sid] = t_now
             step_count += 1
             if step_count > max_steps:
                 unfinished = [s for s in seqs if not s.is_finished()]
@@ -142,9 +185,18 @@ class LLMEngine:
             output_text = self.model_runner.tokenizer.decode(
                 seq.output_token_ids, skip_special_tokens=True
             )
+            ttft_s = None
+            tpot_s = None
+            if seq.seq_id in first_token_t:
+                ttft_s = first_token_t[seq.seq_id] - t_submit
+                num_out = seq.num_output_tokens
+                if num_out > 1:
+                    tpot_s = (last_token_t[seq.seq_id] - first_token_t[seq.seq_id]) / (num_out - 1)
             outputs.append({
                 "text": output_text,
                 "token_ids": seq.output_token_ids,
+                "ttft_s": ttft_s,
+                "tpot_s": tpot_s,
             })
         return outputs
 

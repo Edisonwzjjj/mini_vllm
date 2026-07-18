@@ -148,8 +148,16 @@ def _read_kv_from_blocks(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if isinstance(block_table, torch.Tensor):
         block_table = block_table.to(device=kv_cache.device, dtype=torch.long)
-    K_blocks = kv_cache[layer_idx, block_table, 0]
-    V_blocks = kv_cache[layer_idx, block_table, 1]
+    if kv_cache.dtype == FP8_DTYPE:
+        # Some torch/CUDA builds don't implement advanced (fancy) indexing
+        # for float8_e4m3fn ("index_cuda"/"index_select_cuda" not implemented).
+        # View as uint8 (same byte layout) for the gather, then view back.
+        kv_cache_u8 = kv_cache.view(torch.uint8)
+        K_blocks = kv_cache_u8[layer_idx, block_table, 0].view(FP8_DTYPE)
+        V_blocks = kv_cache_u8[layer_idx, block_table, 1].view(FP8_DTYPE)
+    else:
+        K_blocks = kv_cache[layer_idx, block_table, 0]
+        V_blocks = kv_cache[layer_idx, block_table, 1]
     if kv_cache.dtype == FP8_DTYPE:
         kv_scale = getattr(paged_ctx, "kv_scale", None)
         if kv_scale is None:
@@ -456,19 +464,15 @@ def _tree_verify_attention(
     value_states: torch.Tensor,
     meta: AttentionMeta,
 ) -> torch.Tensor:
+    """Tree speculative verify attention.
+
+    Supports batching (bsz > 1): each sequence in the batch has its own
+    prefix_len/suffix_len/tree_mask, mirroring how _suffix_prefill_attention
+    loops per-sequence. This is what allows tree-PLD speculative decoding to
+    run under concurrent serving instead of being restricted to batch_size=1.
+    """
     kv_cache = paged_ctx.kv_cache
     block_size = kv_cache.shape[4]
-
-    assert meta["bsz"] == 1
-    assert len(paged_ctx.prefix_lengths) == 1
-    assert len(paged_ctx.suffix_lengths) == 1
-    assert len(paged_ctx.block_tables) == 1
-
-    prefix_len = paged_ctx.prefix_lengths[0]
-    suffix_len = paged_ctx.suffix_lengths[0]
-    total_len = prefix_len + suffix_len
-    tree_mask = paged_ctx.tree_mask.to(device=kv_cache.device, dtype=query_states.dtype)
-    assert suffix_len == 1 + tree_mask.size(0)
 
     _write_prefill_kv(
         kv_cache,
@@ -479,27 +483,50 @@ def _tree_verify_attention(
         block_size,
     )
 
-    K_full, V_full = _read_kv_from_blocks(
-        kv_cache,
-        meta["layer_idx"],
-        paged_ctx.block_tables[0],
-        total_len,
-        meta["num_kv_heads"],
-        meta["head_dim"],
-    )
-    K_i = K_full.unsqueeze(0)
-    V_i = V_full.unsqueeze(0)
+    # Backward-compatible single-sequence path (paged_ctx.tree_mask) vs the
+    # batched path (paged_ctx.tree_masks, a list — one per sequence).
+    tree_masks = getattr(paged_ctx, "tree_masks", None)
+    if tree_masks is None:
+        tree_masks = [paged_ctx.tree_mask]
 
-    K_expanded = repeat_kv(K_i, self.num_key_value_groups)
-    V_expanded = repeat_kv(V_i, self.num_key_value_groups)
-    mask = _build_tree_verify_mask(prefix_len, tree_mask, kv_cache.device)
+    attn_outputs: list[torch.Tensor] = []
+    q_offset = 0
+    for prefix_len, suffix_len, block_table, tree_mask in zip(
+        paged_ctx.prefix_lengths,
+        paged_ctx.suffix_lengths,
+        paged_ctx.block_tables,
+        tree_masks,
+    ):
+        total_len = prefix_len + suffix_len
+        tree_mask = tree_mask.to(device=kv_cache.device, dtype=query_states.dtype)
+        assert suffix_len == 1 + tree_mask.size(0)
 
-    return _sdpa(
-        query_states,
-        K_expanded,
-        V_expanded,
-        attn_mask=mask,
-    )
+        Q_i = query_states[:, :, q_offset:q_offset + suffix_len, :]
+        K_full, V_full = _read_kv_from_blocks(
+            kv_cache,
+            meta["layer_idx"],
+            block_table,
+            total_len,
+            meta["num_kv_heads"],
+            meta["head_dim"],
+        )
+        K_i = K_full.unsqueeze(0)
+        V_i = V_full.unsqueeze(0)
+
+        K_expanded = repeat_kv(K_i, self.num_key_value_groups)
+        V_expanded = repeat_kv(V_i, self.num_key_value_groups)
+        mask = _build_tree_verify_mask(prefix_len, tree_mask, kv_cache.device)
+        attn_outputs.append(
+            _sdpa(
+                Q_i,
+                K_expanded,
+                V_expanded,
+                attn_mask=mask,
+            )
+        )
+        q_offset += suffix_len
+
+    return torch.cat(attn_outputs, dim=2)
 
 
 def _output_projection(self: Any, attn_output: torch.Tensor, meta: AttentionMeta) -> torch.Tensor:

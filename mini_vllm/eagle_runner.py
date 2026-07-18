@@ -126,6 +126,174 @@ class EagleRunner:
             return self._tree_step(seq, sampling_params)
         return self._chain_step(seq, sampling_params)
 
+    def step_batch(self, seqs: list[Sequence], sampling_params: SamplingParams) -> list[dict] | None:
+        """Batched speculative decode step across multiple concurrent sequences.
+
+        Returns None to signal OOM (caller should preempt), mirroring
+        ModelRunner.run_decode()'s OOM signaling convention. This is what lets
+        chain-PLD/tree-PLD speculative decoding actually accelerate serving
+        under concurrency instead of being restricted to batch_size=1.
+        """
+        self._check_greedy(sampling_params)
+        if self.mode == "tree":
+            return self._tree_step_batch(seqs, sampling_params)
+        return self._chain_step_batch(seqs, sampling_params)
+
+    def _fallback_decode_step_batch(
+        self, seqs: list[Sequence], sampling_params: SamplingParams
+    ) -> list[dict] | None:
+        """Batched normal-decode fallback (used when a draft is unavailable).
+
+        Reuses ModelRunner.run_decode()'s existing multi-sequence batching.
+        """
+        if not seqs:
+            return []
+        self.metrics["fallback_steps"] += len(seqs)
+
+        logits_list = self.model_runner.run_decode(seqs)
+        if logits_list is None:
+            return None  # OOM — propagate to caller for preemption
+
+        results = []
+        for seq, logits in zip(seqs, logits_list):
+            greedy_token = int(logits.argmax(dim=-1).item())
+            remaining = sampling_params.max_tokens - seq.num_output_tokens
+            if remaining <= 0:
+                continue
+            seq.output_token_ids.append(greedy_token)
+            is_finished = (
+                self.model_runner.is_eos(greedy_token)
+                or seq.num_output_tokens >= sampling_params.max_tokens
+            )
+            if is_finished:
+                seq.mark_finished()
+            results.append({
+                "seq_id": seq.seq_id,
+                "token_id": greedy_token,
+                "text": self.model_runner.tokenizer.decode([greedy_token], skip_special_tokens=True),
+                "finished": is_finished,
+            })
+        return results
+
+    def _chain_step_batch(
+        self, seqs: list[Sequence], sampling_params: SamplingParams
+    ) -> list[dict] | None:
+        active_seqs = [s for s in seqs if sampling_params.max_tokens - s.num_output_tokens > 0]
+        for s in seqs:
+            if s not in active_seqs:
+                s.mark_finished()
+        if not active_seqs:
+            return []
+
+        # Same scaffolding-vs-real-draft policy as the single-sequence path:
+        # only use the dummy draft when a real/oracle/PLD draft source exists.
+        force_fallback_all = (
+            self.model_runner.deterministic
+            and self.draft_token_fn is None
+            and not self.use_pld_default
+        )
+
+        verify_items: list[tuple[Sequence, list[int]]] = []
+        fallback_seqs: list[Sequence] = []
+        for seq in active_seqs:
+            if force_fallback_all:
+                fallback_seqs.append(seq)
+                continue
+            draft_tokens = self._draft_tokens(seq)[: self.draft_len]
+            if not draft_tokens:
+                fallback_seqs.append(seq)
+            else:
+                verify_items.append((seq, draft_tokens))
+
+        results: list[dict] = []
+        if verify_items:
+            batch_results = self.model_runner.run_chain_verify_batch(verify_items)
+            for (seq, draft_tokens), (logits, old_num_cached, _) in zip(verify_items, batch_results):
+                greedy_tokens = logits.argmax(dim=-1).tolist()
+
+                accepted = 0
+                for i, draft_token in enumerate(draft_tokens):
+                    if greedy_tokens[i] != draft_token:
+                        break
+                    accepted += 1
+
+                if accepted == len(draft_tokens):
+                    tokens_to_append = draft_tokens + [greedy_tokens[len(draft_tokens)]]
+                else:
+                    tokens_to_append = draft_tokens[:accepted] + [greedy_tokens[accepted]]
+
+                self.metrics["spec_steps"] += 1
+                self.metrics["draft_tokens_proposed"] += len(draft_tokens)
+                self.metrics["draft_tokens_accepted"] += accepted
+                if accepted == len(draft_tokens):
+                    self.metrics["bonus_tokens"] += 1
+
+                results.extend(self._append_tokens(seq, tokens_to_append, old_num_cached, sampling_params))
+
+        if fallback_seqs:
+            fb = self._fallback_decode_step_batch(fallback_seqs, sampling_params)
+            if fb is None:
+                return None
+            results.extend(fb)
+
+        return results
+
+    def _tree_step_batch(
+        self, seqs: list[Sequence], sampling_params: SamplingParams
+    ) -> list[dict] | None:
+        active_seqs = [s for s in seqs if sampling_params.max_tokens - s.num_output_tokens > 0]
+        for s in seqs:
+            if s not in active_seqs:
+                s.mark_finished()
+        if not active_seqs:
+            return []
+
+        force_fallback_all = (
+            self.model_runner.deterministic
+            and self.draft_tree_fn is None
+            and not self.use_pld_default
+        )
+
+        verify_items: list[tuple[Sequence, DraftTree]] = []
+        fallback_seqs: list[Sequence] = []
+        for seq in active_seqs:
+            if force_fallback_all:
+                fallback_seqs.append(seq)
+                continue
+            tree = self._draft_tree(seq)
+            if tree is None:
+                fallback_seqs.append(seq)
+            else:
+                verify_items.append((seq, tree))
+
+        results: list[dict] = []
+        if verify_items:
+            batch_results = self.model_runner.run_tree_verify_batch(verify_items)
+            for (seq, tree), (logits, old_num_cached, _) in zip(verify_items, batch_results):
+                greedy_tokens = logits.argmax(dim=-1).tolist()
+
+                accepted_path = self._accepted_leftmost_path(tree, greedy_tokens)
+                accepted_tokens = [tree.token_ids[i] for i in accepted_path]
+                pred_pos = 0 if not accepted_path else 1 + accepted_path[-1]
+                tokens_to_append = accepted_tokens + [greedy_tokens[pred_pos]]
+
+                self.metrics["spec_steps"] += 1
+                leftmost_chain_len = self._leftmost_chain_len(tree)
+                self.metrics["draft_tokens_proposed"] += leftmost_chain_len
+                self.metrics["draft_tokens_accepted"] += len(accepted_path)
+                if len(accepted_path) == leftmost_chain_len and leftmost_chain_len > 0:
+                    self.metrics["bonus_tokens"] += 1
+
+                results.extend(self._append_tokens(seq, tokens_to_append, old_num_cached, sampling_params))
+
+        if fallback_seqs:
+            fb = self._fallback_decode_step_batch(fallback_seqs, sampling_params)
+            if fb is None:
+                return None
+            results.extend(fb)
+
+        return results
+
     def _chain_step(self, seq: Sequence, sampling_params: SamplingParams) -> list[dict]:
         remaining_tokens = sampling_params.max_tokens - seq.num_output_tokens
         if remaining_tokens <= 0:

@@ -15,8 +15,8 @@ from pathlib import Path
 
 from metrics import (
     BenchmarkResult,
+    aggregate_ttft_tpot,
     block_manager_stats,
-    compute_tpot,
     count_prompt_tokens,
     environment_info,
     kv_cache_size_gb,
@@ -106,23 +106,21 @@ def make_llm(args: argparse.Namespace, method: MethodConfig) -> LLM:
     )
 
 
-def run_ttft(args: argparse.Namespace, method: MethodConfig, prompts: list[str], sp: SamplingParams) -> float | None:
-    import torch
+def run_warmup(args: argparse.Namespace, llm) -> None:
+    """Run one short, discarded generation to trigger lazy one-time costs
+    (first CUDA Graph capture, cuDNN/cuBLAS algo autotune, etc.) before the
+    timed run. Uses a prompt that never overlaps with the real workload, so
+    it doesn't inflate the real run's prefix-cache hit rate.
 
-    if args.skip_ttft:
-        return None
+    Per the execution handbook: without this, the first CUDA Graph capture
+    (which is much slower than a replay) could land inside the timed window.
+    """
+    if args.skip_warmup:
+        return
+    from mini_vllm import SamplingParams
 
-    llm = make_llm(args, method)
-    t0 = now_s()
-    ttft = None
-    for _chunk in llm.generate_stream(prompts, sp):
-        ttft = now_s() - t0
-        break
-    del llm
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return ttft
+    warmup_sp = SamplingParams(temperature=0.0, max_tokens=4)
+    llm.generate(["mini-vllm benchmark warmup pass, ignore this output."], warmup_sp)
 
 
 def run_full(
@@ -131,13 +129,14 @@ def run_full(
     workload_name: str,
     prompts: list[str],
     sp: SamplingParams,
-    ttft_s: float | None,
 ) -> BenchmarkResult:
     import torch
 
     llm = make_llm(args, method)
     tokenizer = llm.engine.model_runner.tokenizer
     prompt_tokens = count_prompt_tokens(tokenizer, prompts)
+
+    run_warmup(args, llm)
 
     reset_peak_memory()
     t0 = now_s()
@@ -151,6 +150,12 @@ def run_full(
     tokens_per_s = output_tokens / elapsed if elapsed > 0 else 0.0
     kv_dtype = str(mr.kv_cache.dtype).replace("torch.", "")
 
+    # True per-request TTFT/TPOT: each output dict already carries its own
+    # ttft_s/tpot_s, recorded from real per-request timestamps inside
+    # LLMEngine.generate() (see engine.py) — not from a separate stream pass
+    # against a fresh engine, and not derived from batch-level elapsed time.
+    latency = aggregate_ttft_tpot(outputs)
+
     result = BenchmarkResult(
         method=method.name,
         workload=workload_name,
@@ -159,9 +164,13 @@ def run_full(
         output_tokens=output_tokens,
         max_tokens=sp.max_tokens,
         elapsed_s=elapsed,
-        ttft_s=ttft_s,
-        tpot_s=compute_tpot(elapsed, ttft_s, output_tokens),
         tokens_per_s=tokens_per_s,
+        ttft_s_mean=latency["ttft_s_mean"],
+        ttft_s_p50=latency["ttft_s_p50"],
+        ttft_s_p90=latency["ttft_s_p90"],
+        tpot_s_mean=latency["tpot_s_mean"],
+        tpot_s_p50=latency["tpot_s_p50"],
+        tpot_s_p90=latency["tpot_s_p90"],
         peak_memory_gb=peak_memory_gb(),
         kv_cache_gb=kv_cache_size_gb(mr),
         kv_cache_dtype=kv_dtype,
@@ -200,15 +209,18 @@ def run_method(
     method = METHODS[method_name]
     sp = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
     print(f"\n--- {method.name} / workload={workload_name} / requests={len(prompts)} ---")
-    ttft_s = run_ttft(args, method, prompts, sp)
-    if ttft_s is not None:
-        print(f"TTFT: {ttft_s:.3f}s")
-    result = run_full(args, method, workload_name, prompts, sp, ttft_s)
+    result = run_full(args, method, workload_name, prompts, sp)
     print(
         f"tokens={result.output_tokens} elapsed={result.elapsed_s:.2f}s "
         f"tok/s={result.tokens_per_s:.2f} peak={result.peak_memory_gb}GB "
         f"graphs={result.cuda_graph_captures}/{result.cuda_graph_replays}"
     )
+    if result.ttft_s_mean is not None:
+        print(
+            f"latency: TTFT mean={result.ttft_s_mean:.3f}s p50={result.ttft_s_p50:.3f}s "
+            f"p90={result.ttft_s_p90:.3f}s | TPOT mean={result.tpot_s_mean:.4f}s "
+            f"p50={result.tpot_s_p50:.4f}s p90={result.tpot_s_p90:.4f}s"
+        )
     if result.draft_tokens_proposed:
         print(
             f"spec: steps={result.spec_steps} accepted={result.draft_tokens_accepted}/"
@@ -227,7 +239,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Comma-separated subset of greedy,chain-pld,tree-pld,tree-dummy")
     parser.add_argument("--json-out", default=None, help="Append results to this JSONL file.")
     parser.add_argument("--markdown-out", default=None, help="Write markdown summary table.")
-    parser.add_argument("--skip-ttft", action="store_true", help="Skip stream pass used to measure TTFT.")
+    parser.add_argument(
+        "--skip-ttft", action="store_true",
+        help="Deprecated no-op, kept for backward compatibility with existing scripts. "
+             "TTFT/TPOT are now always measured from real per-request timestamps inside "
+             "the single generate() call (no separate stream pass needed).",
+    )
+    parser.add_argument(
+        "--skip-warmup", action="store_true",
+        help="Skip the discarded warmup generation. Not recommended for timed runs: "
+             "without it, one-time costs (first CUDA Graph capture, cuBLAS/cuDNN algo "
+             "autotune) can land inside the timed window and inflate elapsed_s/TTFT.",
+    )
 
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-num-seqs", type=int, default=1)

@@ -25,7 +25,7 @@ class ModelRunner:
         self._validate_kv_config()
 
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path, dtype=torch.bfloat16
+            model_path, torch_dtype=torch.bfloat16
         ).to(self.device).eval()
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.compute_dtype = next(self.model.parameters()).dtype
@@ -42,6 +42,14 @@ class ModelRunner:
         self.head_dim = self._resolve_head_dim(cfg)
         self.eos_token_id = cfg.eos_token_id
         self.eos_token_ids = self._normalize_eos_token_ids(cfg.eos_token_id)
+        # MoE models (e.g. Qwen3-MoE / Qwen3-Coder-30B-A3B) route each token to
+        # a data-dependent subset of experts via `torch.where` inside the MLP
+        # block. That control flow is not capturable: CUDA Graph capture fails
+        # with "operation not permitted when stream is capturing". Detect MoE
+        # via config and force eager decode for these models.
+        self.is_moe_model = bool(
+            getattr(cfg, "num_experts", None) or getattr(cfg, "num_local_experts", None)
+        )
         self._validate_model_layout()
         self._validate_kv_config()
         if self.kv_cache_dtype == "fp8_e4m3" and self.kv_scale is None:
@@ -241,11 +249,15 @@ class ModelRunner:
 
         capacity = ((max_cached + self.block_size - 1) // self.block_size) * self.block_size
         dtype = self.compute_dtype
-        self.decode_k_batch = torch.empty(
+        # Zero-init (not torch.empty): the tail beyond each seq's num_cached
+        # is masked with -inf in the attention scores, but NaN + (-inf) is
+        # still NaN — uninitialized garbage here can poison the whole softmax
+        # row and produce NaN logits for every decode step.
+        self.decode_k_batch = torch.zeros(
             self.max_num_seqs, self.num_kv_heads, capacity, self.head_dim,
             dtype=dtype, device=self.device,
         )
-        self.decode_v_batch = torch.empty(
+        self.decode_v_batch = torch.zeros(
             self.max_num_seqs, self.num_kv_heads, capacity, self.head_dim,
             dtype=dtype, device=self.device,
         )
@@ -286,6 +298,7 @@ class ModelRunner:
         return (
             self.device == "cuda"
             and not self.deterministic
+            and not self.is_moe_model
             and bsz > 0
             and self.decode_kv_capacity > 0
         )
@@ -638,6 +651,176 @@ class ModelRunner:
 
         return outputs.logits[0], old_num_cached, target_num_cached
 
+
+    def run_chain_verify_batch(
+        self, items: list[tuple[Sequence, list[int]]]
+    ) -> list[tuple[torch.Tensor, int, int]]:
+        """Batched chain speculative verify across multiple sequences.
+
+        Reuses the same variable-length suffix-prefill attention path as
+        run_prefill()/_suffix_prefill_attention: each sequence contributes
+        prefix_len=old_num_cached, suffix=[last_token]+draft_tokens. This is
+        what lets chain-PLD speculative decoding actually accelerate batched
+        (concurrent) serving instead of being restricted to batch_size=1.
+
+        In deterministic mode, follows the same policy as run_prefill()/
+        run_decode(): run each sequence independently to avoid batched-GEMM
+        numerics flipping a greedy argmax.
+        """
+        if self.deterministic and len(items) > 1:
+            out = []
+            for item in items:
+                out.extend(self.run_chain_verify_batch([item]))
+            return out
+
+        all_input_ids: list[int] = []
+        all_position_ids: list[int] = []
+        all_slots: list[int] = []
+        suffix_lengths: list[int] = []
+        prefix_lengths: list[int] = []
+        seq_list: list[Sequence] = []
+        old_cached_list: list[int] = []
+        target_cached_list: list[int] = []
+
+        for seq, draft_token_ids in items:
+            verify_token_ids = [seq.last_token_id] + draft_token_ids
+            old_num_cached = seq.num_cached_tokens
+            target_num_cached = old_num_cached + len(verify_token_ids)
+
+            num_blocks_needed = self.block_manager.num_blocks_needed(target_num_cached)
+            cur_blocks = len(seq.block_table[0])
+            if cur_blocks < num_blocks_needed:
+                new_blocks = self.block_manager.try_allocate(num_blocks_needed - cur_blocks)
+                if new_blocks is None:
+                    raise RuntimeError("OOM during batched chain speculative verification")
+                for layer in range(self.num_layers):
+                    seq.block_table[layer].extend(new_blocks)
+
+            full_slot_mapping = self.block_manager.get_slot_mapping(
+                seq.block_table[0], target_num_cached
+            )
+            suffix_slot_mapping = full_slot_mapping[old_num_cached:target_num_cached]
+
+            all_input_ids.extend(verify_token_ids)
+            all_position_ids.extend(range(old_num_cached, target_num_cached))
+            all_slots.extend(suffix_slot_mapping)
+            suffix_lengths.append(len(verify_token_ids))
+            prefix_lengths.append(old_num_cached)
+            seq_list.append(seq)
+            old_cached_list.append(old_num_cached)
+            target_cached_list.append(target_num_cached)
+
+        input_ids = torch.tensor([all_input_ids], device=self.device)
+        position_ids = torch.tensor([all_position_ids], device=self.device)
+
+        self._set_kv_runtime_context()
+        paged_ctx.kv_cache = self.kv_cache
+        paged_ctx.deterministic = self.deterministic
+        paged_ctx.slot_mapping = all_slots
+        paged_ctx.is_prefill = True
+        paged_ctx.attn_mask = None
+        paged_ctx.prefix_lengths = prefix_lengths
+        paged_ctx.suffix_lengths = suffix_lengths
+        paged_ctx.block_tables = [seq.block_table[0] for seq in seq_list]
+
+        with torch.no_grad():
+            outputs = self.model(input_ids=input_ids, position_ids=position_ids)
+
+        logits = outputs.logits[0]  # (total_suffix_len, vocab)
+        results = []
+        start = 0
+        for i in range(len(seq_list)):
+            length = suffix_lengths[i]
+            results.append((logits[start:start + length], old_cached_list[i], target_cached_list[i]))
+            start += length
+        return results
+
+    def run_tree_verify_batch(
+        self, items: list[tuple[Sequence, DraftTree]]
+    ) -> list[tuple[torch.Tensor, int, int]]:
+        """Batched tree speculative verify across multiple sequences.
+
+        Same idea as run_chain_verify_batch: each sequence contributes its own
+        prefix_len/suffix/tree_mask, computed via a per-sequence loop in
+        _tree_verify_attention (mirrors _suffix_prefill_attention's pattern).
+
+        In deterministic mode, runs each sequence independently (same policy
+        as run_chain_verify_batch / run_prefill / run_decode).
+        """
+        if self.deterministic and len(items) > 1:
+            out = []
+            for item in items:
+                out.extend(self.run_tree_verify_batch([item]))
+            return out
+
+        all_input_ids: list[int] = []
+        all_position_ids: list[int] = []
+        all_slots: list[int] = []
+        suffix_lengths: list[int] = []
+        prefix_lengths: list[int] = []
+        seq_list: list[Sequence] = []
+        old_cached_list: list[int] = []
+        target_cached_list: list[int] = []
+        tree_masks: list[torch.Tensor] = []
+
+        for seq, draft_tree in items:
+            verify_token_ids = [seq.last_token_id] + draft_tree.token_ids
+            old_num_cached = seq.num_cached_tokens
+            target_num_cached = old_num_cached + len(verify_token_ids)
+
+            num_blocks_needed = self.block_manager.num_blocks_needed(target_num_cached)
+            cur_blocks = len(seq.block_table[0])
+            if cur_blocks < num_blocks_needed:
+                new_blocks = self.block_manager.try_allocate(num_blocks_needed - cur_blocks)
+                if new_blocks is None:
+                    raise RuntimeError("OOM during batched tree speculative verification")
+                for layer in range(self.num_layers):
+                    seq.block_table[layer].extend(new_blocks)
+
+            full_slot_mapping = self.block_manager.get_slot_mapping(
+                seq.block_table[0], target_num_cached
+            )
+            suffix_slot_mapping = full_slot_mapping[old_num_cached:target_num_cached]
+
+            all_input_ids.extend(verify_token_ids)
+            all_position_ids.extend(range(old_num_cached, target_num_cached))
+            all_slots.extend(suffix_slot_mapping)
+            suffix_lengths.append(len(verify_token_ids))
+            prefix_lengths.append(old_num_cached)
+            seq_list.append(seq)
+            old_cached_list.append(old_num_cached)
+            target_cached_list.append(target_num_cached)
+            tree_masks.append(draft_tree.build_tree_mask(torch.device(self.device)))
+
+        input_ids = torch.tensor([all_input_ids], device=self.device)
+        position_ids = torch.tensor([all_position_ids], device=self.device)
+
+        self._set_kv_runtime_context()
+        paged_ctx.kv_cache = self.kv_cache
+        paged_ctx.deterministic = self.deterministic
+        paged_ctx.slot_mapping = all_slots
+        paged_ctx.is_prefill = True
+        paged_ctx.is_tree_verify = True
+        paged_ctx.attn_mask = None
+        paged_ctx.prefix_lengths = prefix_lengths
+        paged_ctx.suffix_lengths = suffix_lengths
+        paged_ctx.block_tables = [seq.block_table[0] for seq in seq_list]
+        paged_ctx.tree_masks = tree_masks
+
+        try:
+            with torch.no_grad():
+                outputs = self.model(input_ids=input_ids, position_ids=position_ids)
+        finally:
+            paged_ctx.is_tree_verify = False
+
+        logits = outputs.logits[0]
+        results = []
+        start = 0
+        for i in range(len(seq_list)):
+            length = suffix_lengths[i]
+            results.append((logits[start:start + length], old_cached_list[i], target_cached_list[i]))
+            start += length
+        return results
 
     def run_chain_verify(self, seq: Sequence, draft_token_ids: list[int]) -> tuple[torch.Tensor, int, int]:
         """Run target-model verification for chain speculative decoding.

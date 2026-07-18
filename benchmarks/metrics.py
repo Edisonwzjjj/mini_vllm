@@ -19,9 +19,20 @@ class BenchmarkResult:
     output_tokens: int
     max_tokens: int
     elapsed_s: float
-    ttft_s: float | None
-    tpot_s: float | None
     tokens_per_s: float
+    # Per-request TTFT/TPOT, aggregated across all requests in this run.
+    # Computed from real per-request timestamps recorded inside
+    # LLMEngine.generate() (see engine.py), not from a separate stream pass —
+    # each request's own first/last output-token time is used, so this is a
+    # true per-request metric rather than "time to first token of the whole
+    # batch". None when no request produced a measurable timestamp (e.g. 0
+    # requests) or, for tpot_p*, when no request had >1 output token.
+    ttft_s_mean: float | None
+    ttft_s_p50: float | None
+    ttft_s_p90: float | None
+    tpot_s_mean: float | None
+    tpot_s_p50: float | None
+    tpot_s_p90: float | None
     peak_memory_gb: float | None
     kv_cache_gb: float | None
     kv_cache_dtype: str
@@ -161,10 +172,38 @@ def spec_metrics(engine: Any) -> dict[str, Any]:
     }
 
 
-def compute_tpot(elapsed_s: float, ttft_s: float | None, output_tokens: int) -> float | None:
-    if ttft_s is None or output_tokens <= 1:
+def _percentile(values: list[float], pct: float) -> float | None:
+    """Nearest-rank percentile (no numpy dependency). pct in [0, 100]."""
+    if not values:
         return None
-    return max(elapsed_s - ttft_s, 0.0) / (output_tokens - 1)
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = pct / 100 * (len(ordered) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = rank - lo
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+
+
+def aggregate_ttft_tpot(outputs: list[dict]) -> dict[str, float | None]:
+    """Aggregate per-request ttft_s/tpot_s (from LLMEngine.generate() outputs)
+    into mean/p50/p90 across all requests in one benchmark run.
+    """
+    ttfts = [o["ttft_s"] for o in outputs if o.get("ttft_s") is not None]
+    tpots = [o["tpot_s"] for o in outputs if o.get("tpot_s") is not None]
+
+    def _mean(vals: list[float]) -> float | None:
+        return sum(vals) / len(vals) if vals else None
+
+    return {
+        "ttft_s_mean": _mean(ttfts),
+        "ttft_s_p50": _percentile(ttfts, 50),
+        "ttft_s_p90": _percentile(ttfts, 90),
+        "tpot_s_mean": _mean(tpots),
+        "tpot_s_p50": _percentile(tpots, 50),
+        "tpot_s_p90": _percentile(tpots, 90),
+    }
 
 
 def write_jsonl(path: str | Path, rows: list[BenchmarkResult]) -> None:
@@ -190,8 +229,8 @@ def markdown_table(rows: list[BenchmarkResult]) -> str:
         "req",
         "out_tok",
         "tok/s",
-        "TTFT(s)",
-        "TPOT(s)",
+        "TTFT p50/p90(s)",
+        "TPOT p50/p90(s)",
         "peakGB",
         "kvGB",
         "hit%",
@@ -206,14 +245,16 @@ def markdown_table(rows: list[BenchmarkResult]) -> str:
     for r in rows:
         hit_pct = None if r.prefix_hit_rate is None else r.prefix_hit_rate * 100
         acc_pct = None if r.acceptance_rate is None else r.acceptance_rate * 100
+        ttft_str = f"{_fmt(r.ttft_s_p50)}/{_fmt(r.ttft_s_p90)}"
+        tpot_str = f"{_fmt(r.tpot_s_p50)}/{_fmt(r.tpot_s_p90)}"
         values = [
             r.method,
             r.workload,
             r.num_requests,
             r.output_tokens,
             f"{r.tokens_per_s:.2f}",
-            _fmt(r.ttft_s),
-            _fmt(r.tpot_s),
+            ttft_str,
+            tpot_str,
             _fmt(r.peak_memory_gb, 2),
             _fmt(r.kv_cache_gb, 2),
             _fmt(hit_pct, 1),
